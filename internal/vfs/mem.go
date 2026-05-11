@@ -1,0 +1,302 @@
+package vfs
+
+import (
+	"bytes"
+	"errors"
+	"io"
+	"io/fs"
+	"maps"
+	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+)
+
+// ErrStaleHandle is returned by operations on a file handle that was open
+// when Mem.Crash was called. The process that owned it is considered dead.
+var ErrStaleHandle = errors.New("vfs: file handle invalidated by crash")
+
+// Op identifies an operation passed to a fault hook.
+type Op int
+
+const (
+	OpWrite Op = iota
+	OpSync
+	OpTruncate
+	OpSyncDir
+)
+
+func (o Op) String() string {
+	switch o {
+	case OpWrite:
+		return "write"
+	case OpSync:
+		return "sync"
+	case OpTruncate:
+		return "truncate"
+	case OpSyncDir:
+		return "syncdir"
+	}
+	return "unknown"
+}
+
+// Mem is an in-memory filesystem that models what survives a crash.
+//
+// Each file has two versions of its contents: what the running process sees,
+// and what has been made durable by Sync. The namespace is modeled the same
+// way: a created file's name only becomes durable when its directory is
+// synced with SyncDir.
+//
+// Crash discards everything that is not durable, except that a random prefix
+// of unsynced appended bytes may survive, possibly with its last few bytes
+// zeroed or replaced by garbage. That models a torn write.
+//
+// Mem is safe for concurrent use.
+type Mem struct {
+	mu      sync.Mutex
+	files   map[string]*inode // namespace as the running process sees it
+	durable map[string]*inode // namespace as it would be after a crash
+	epoch   uint64            // incremented by Crash; invalidates open handles
+	fault   func(op Op, name string) error
+}
+
+var _ FS = (*Mem)(nil)
+
+type inode struct {
+	data   []byte // contents as the running process sees them
+	synced []byte // contents guaranteed to survive a crash
+}
+
+// NewMem returns an empty in-memory filesystem.
+func NewMem() *Mem {
+	return &Mem{
+		files:   make(map[string]*inode),
+		durable: make(map[string]*inode),
+	}
+}
+
+// SetFault installs a hook called before every write, sync, truncate, and
+// directory sync. If it returns an error, the operation fails with that error
+// and has no effect. The hook runs with Mem's lock held and must not call
+// back into Mem. Pass nil to remove it.
+func (m *Mem) SetFault(fn func(op Op, name string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fault = fn
+}
+
+func (m *Mem) injected(op Op, name string) error {
+	if m.fault == nil {
+		return nil
+	}
+	return m.fault(op, name)
+}
+
+func (m *Mem) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	name = filepath.Clean(name)
+	ino, ok := m.files[name]
+	switch {
+	case ok && flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0:
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrExist}
+	case !ok && flag&os.O_CREATE == 0:
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	case !ok:
+		ino = &inode{}
+		m.files[name] = ino
+	}
+	if flag&os.O_TRUNC != 0 {
+		ino.data = nil
+	}
+	return &memFile{fs: m, ino: ino, name: name, flag: flag, epoch: m.epoch}, nil
+}
+
+func (m *Mem) SyncDir(dir string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dir = filepath.Clean(dir)
+	if err := m.injected(OpSyncDir, dir); err != nil {
+		return err
+	}
+	for name := range m.durable {
+		if filepath.Dir(name) == dir && m.files[name] == nil {
+			delete(m.durable, name)
+		}
+	}
+	for name, ino := range m.files {
+		if filepath.Dir(name) == dir {
+			m.durable[name] = ino
+		}
+	}
+	return nil
+}
+
+// Crash simulates a power failure followed by a restart. Every open handle
+// becomes stale, and each file's contents are replaced by what could have
+// survived on disk. All randomness comes from rng, so a given seed always
+// produces the same outcome.
+func (m *Mem) Crash(rng *rand.Rand) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.epoch++
+	files := make(map[string]*inode, len(m.durable))
+	// Sorted so rng is consumed in a deterministic order.
+	for _, name := range slices.Sorted(maps.Keys(m.durable)) {
+		ino := m.durable[name]
+		ino.data = survivingContents(ino, rng)
+		ino.synced = bytes.Clone(ino.data)
+		files[name] = ino
+	}
+	m.files = files
+}
+
+func survivingContents(ino *inode, rng *rand.Rand) []byte {
+	synced, data := ino.synced, ino.data
+	if !bytes.HasPrefix(data, synced) {
+		// The file was truncated or overwritten since the last sync. Model
+		// the change as either fully reaching disk or not at all.
+		if rng.IntN(2) == 0 {
+			return bytes.Clone(synced)
+		}
+		return bytes.Clone(data)
+	}
+	// Only appends since the last sync: any prefix of the unsynced tail may
+	// have reached disk, and the last bytes of it may be torn.
+	tail := data[len(synced):]
+	k := rng.IntN(len(tail) + 1)
+	out := append(bytes.Clone(synced), tail[:k]...)
+	if k > 0 && rng.IntN(4) == 0 {
+		torn := out[len(out)-1-rng.IntN(min(k, 16)):]
+		if rng.IntN(2) == 0 {
+			clear(torn)
+		} else {
+			for i := range torn {
+				torn[i] = byte(rng.Uint32())
+			}
+		}
+	}
+	return out
+}
+
+type memFile struct {
+	fs     *Mem
+	ino    *inode
+	name   string
+	flag   int
+	epoch  uint64
+	off    int64
+	closed bool
+}
+
+// check reports whether the handle can be used. Caller holds fs.mu.
+func (f *memFile) check() error {
+	if f.closed {
+		return os.ErrClosed
+	}
+	if f.epoch != f.fs.epoch {
+		return ErrStaleHandle
+	}
+	return nil
+}
+
+func (f *memFile) writable() bool {
+	return f.flag&(os.O_WRONLY|os.O_RDWR) != 0
+}
+
+func (f *memFile) Write(p []byte) (int, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check(); err != nil {
+		return 0, err
+	}
+	if !f.writable() {
+		return 0, &fs.PathError{Op: "write", Path: f.name, Err: fs.ErrPermission}
+	}
+	if err := f.fs.injected(OpWrite, f.name); err != nil {
+		return 0, err
+	}
+	if f.flag&os.O_APPEND != 0 {
+		f.off = int64(len(f.ino.data))
+	}
+	if end := f.off + int64(len(p)); end > int64(len(f.ino.data)) {
+		f.ino.data = append(f.ino.data, make([]byte, end-int64(len(f.ino.data)))...)
+	}
+	n := copy(f.ino.data[f.off:], p)
+	f.off += int64(n)
+	return n, nil
+}
+
+func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check(); err != nil {
+		return 0, err
+	}
+	if off < 0 {
+		return 0, &fs.PathError{Op: "readat", Path: f.name, Err: fs.ErrInvalid}
+	}
+	if off >= int64(len(f.ino.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.ino.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *memFile) Sync() error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check(); err != nil {
+		return err
+	}
+	if err := f.fs.injected(OpSync, f.name); err != nil {
+		return err
+	}
+	f.ino.synced = bytes.Clone(f.ino.data)
+	return nil
+}
+
+func (f *memFile) Truncate(size int64) error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check(); err != nil {
+		return err
+	}
+	if !f.writable() || size < 0 {
+		return &fs.PathError{Op: "truncate", Path: f.name, Err: fs.ErrInvalid}
+	}
+	if err := f.fs.injected(OpTruncate, f.name); err != nil {
+		return err
+	}
+	if size <= int64(len(f.ino.data)) {
+		f.ino.data = f.ino.data[:size]
+	} else {
+		f.ino.data = append(f.ino.data, make([]byte, size-int64(len(f.ino.data)))...)
+	}
+	return nil
+}
+
+func (f *memFile) Size() (int64, error) {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if err := f.check(); err != nil {
+		return 0, err
+	}
+	return int64(len(f.ino.data)), nil
+}
+
+// Close always succeeds on a stale handle, so code that cleans up after a
+// simulated crash does not have to special-case it.
+func (f *memFile) Close() error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.closed {
+		return os.ErrClosed
+	}
+	f.closed = true
+	return nil
+}
