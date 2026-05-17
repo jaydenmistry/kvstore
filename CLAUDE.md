@@ -83,5 +83,5 @@ Create packages only when the phase that needs them begins.
 
 ## Commands
 
-`make build | test | race | vet | fmtcheck | staticcheck | lint | clean`.
+`make build | test | race | vet | fmtcheck | staticcheck | lint | fuzz | clean`.
 `staticcheck` runs a pinned version through `go run`, which keeps it out of go.mod.

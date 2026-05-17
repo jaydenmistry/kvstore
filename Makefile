@@ -1,8 +1,9 @@
 GO ?= go
 BIN ?= bin
 STATICCHECK_VERSION ?= v0.8.2
+FUZZTIME ?= 30s
 
-.PHONY: all build test race vet fmtcheck staticcheck lint clean
+.PHONY: all build test race vet fmtcheck staticcheck lint fuzz clean
 
 all: lint race build
 
@@ -27,6 +28,9 @@ staticcheck:
 	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
 
 lint: fmtcheck vet staticcheck
+
+fuzz:
+	$(GO) test ./internal/wal -run='^$$' -fuzz=FuzzDecodeAll -fuzztime=$(FUZZTIME)
 
 clean:
 	rm -rf $(BIN)
