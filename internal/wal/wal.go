@@ -10,6 +10,11 @@
 //     interrupted by a crash, in the order they were appended.
 //   - Open discards a torn final write, which was never acknowledged, but
 //     refuses to discard damaged data that has valid records after it.
+//
+// One case is inherently ambiguous: damage confined to the final record
+// looks exactly like a torn write, so it is truncated even if that record was
+// acknowledged and later hit by bit rot. Telling the two apart would need
+// information from outside this file.
 package wal
 
 import (
@@ -42,8 +47,8 @@ type WAL struct {
 }
 
 // Open opens the log at path, creating it if needed, and returns the records
-// it contains. If the file ends in a torn write, the torn bytes are truncated
-// away (and the truncation fsynced) before Open returns. If the file is
+// it contains, all of which are durable when Open returns. If the file ends
+// in a torn write, the torn bytes are truncated away before Open returns. If the file is
 // damaged in the middle, Open returns an error matching ErrCorrupt and leaves
 // the file untouched.
 func Open(fsys vfs.FS, path string) (*WAL, []Record, error) {
@@ -83,15 +88,21 @@ func recoverLog(fsys vfs.FS, path string, f vfs.File) (*WAL, []Record, error) {
 		return nil, nil, err
 	}
 	if int64(valid) < size {
-		// Truncation must be durable before any new append. Otherwise a
-		// crash could bring back the torn bytes, now followed by new valid
-		// records, and the next recovery would report corruption.
 		if err := f.Truncate(int64(valid)); err != nil {
 			return nil, nil, fmt.Errorf("wal: truncate torn tail: %w", err)
 		}
-		if err := f.Sync(); err != nil {
-			return nil, nil, fmt.Errorf("wal: sync after truncate: %w", err)
-		}
+	}
+	// Sync even if nothing was truncated. The bytes just read may exist only
+	// in the page cache: a previous process can be killed between writing a
+	// record and fsyncing it. Returning such a record as part of the log
+	// would let Raft acknowledge an entry that a power loss could still
+	// erase. After this fsync, everything returned is durable.
+	//
+	// The same fsync makes a truncation durable before any new append.
+	// Otherwise a crash could bring back the torn bytes, now followed by new
+	// valid records, and the next recovery would report corruption.
+	if err := f.Sync(); err != nil {
+		return nil, nil, fmt.Errorf("wal: sync: %w", err)
 	}
 	return &WAL{f: f}, recs, nil
 }
