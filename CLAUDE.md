@@ -47,8 +47,9 @@ Create packages only when the phase that needs them begins.
 - The Raft core is tick-driven (`Tick()`), not wall-clock driven, so tests are deterministic.
 - Persist `currentTerm`, `votedFor`, and log entries before replying to any RPC
   (Raft paper, Figure 2).
-- The WAL is append-only. `Append` returns only after fsync. A new file's parent
-  directory is fsynced too.
+- The WAL is append-only. `Append` returns only after fsync. `Open` fsyncs the
+  parent directory and the file itself, because bytes read back after a process
+  kill may exist only in the page cache.
 - A failed fsync is fatal: the WAL refuses further writes and the node must restart
   and recover. Never retry fsync (on Linux a failed fsync can drop dirty pages).
 - Recovery may truncate only a torn final record, which was never acknowledged.
