@@ -58,6 +58,17 @@ Create packages only when the phase that needs them begins.
   (pages of one write may reach disk in any order, so the damage can be a hole).
   Damage followed by a valid frame returns `ErrCorrupt` and the file is left untouched.
 
+## Decisions
+
+- **fsync failure is fail-stop.** On any WAL write or fsync error, kvserver logs
+  what happened and exits with a dedicated exit code, and must not restart itself
+  (ship a systemd unit with `RestartPreventExitStatus=`). Before restarting the
+  node, drop the host page cache (`echo 3 > /proc/sys/vm/drop_caches`) or reboot
+  the host; restarting an LXC container does not clear the host's cache.
+  `O_DIRECT` was considered and deferred: it needs 4 KiB-aligned writes (padding
+  every append, or rewriting blocks that hold acknowledged data), and behaves
+  differently on tmpfs and ZFS.
+
 ## Testing
 
 - Tests are deterministic: seeded RNGs (log the seed on failure), no `time.Sleep`,
