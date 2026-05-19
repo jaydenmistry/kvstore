@@ -31,7 +31,7 @@ Module: `github.com/jaydenmistry/kvstore`. Go 1.27, Linux.
 cmd/kvserver/        node binary
 cmd/kvctl/           CLI client
 internal/vfs/        filesystem interface: OS implementation + crash-simulating in-memory FS
-internal/wal/        append-only record log (length + CRC32C framing, torn-tail recovery); Raft-agnostic
+internal/wal/        append-only log; one CRC32C frame per Append (crash-atomic batch); Raft-agnostic
 internal/raft/       consensus core; defines the Transport and Storage interfaces it consumes
 internal/transport/  in-memory deterministic transport for tests; real network transport
 internal/kv/         state machine and client dedup table (client ID + sequence number)
@@ -47,13 +47,16 @@ Create packages only when the phase that needs them begins.
 - The Raft core is tick-driven (`Tick()`), not wall-clock driven, so tests are deterministic.
 - Persist `currentTerm`, `votedFor`, and log entries before replying to any RPC
   (Raft paper, Figure 2).
-- The WAL is append-only. `Append` returns only after fsync. `Open` fsyncs the
+- The WAL is append-only. Each `Append` is one checksummed frame: all of its
+  records survive a crash or none do. `Append` returns only after fsync. `Open` fsyncs the
   parent directory and the file itself, because bytes read back after a process
   kill may exist only in the page cache.
-- A failed fsync is fatal: the WAL refuses further writes and the node must restart
-  and recover. Never retry fsync (on Linux a failed fsync can drop dirty pages).
-- Recovery may truncate only a torn final record, which was never acknowledged.
-  Corruption followed by valid data returns `ErrCorrupt` and the file is left untouched.
+- A failed fsync is fatal: the WAL refuses further writes and the node process must
+  exit. Never retry fsync (on Linux a failed fsync can drop dirty pages and mark
+  them clean, so even a restarted process may read data that is not on disk).
+- Recovery may discard only a damaged final frame, which was never acknowledged
+  (pages of one write may reach disk in any order, so the damage can be a hole).
+  Damage followed by a valid frame returns `ErrCorrupt` and the file is left untouched.
 
 ## Testing
 
