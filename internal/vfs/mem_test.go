@@ -128,6 +128,42 @@ func TestMemCrashOutcomesVary(t *testing.T) {
 	}
 }
 
+func TestMemCrashCanReorderPages(t *testing.T) {
+	// Pages of an unsynced write may reach disk out of order, leaving a hole
+	// of zeros followed by data that did make it.
+	for seed := range uint64(200) {
+		m := NewMem()
+		m.SetPageSize(4)
+		f := mustOpen(t, m, "/d/f", rw)
+		m.SyncDir("/d")
+		mustWrite(t, f, "aaaabbbbccccdddd")
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		got := contents(t, m, "/d/f")
+		if len(got) >= 8 && bytes.Equal(got[:4], make([]byte, 4)) && string(got[4:8]) == "bbbb" {
+			return
+		}
+	}
+	t.Fatal("no crash produced a lost page followed by a surviving one")
+}
+
+func TestMemCrashKeepsSyncedPartOfPage(t *testing.T) {
+	// A page that holds both synced and unsynced bytes must never lose the
+	// synced ones, whether or not the page was written back.
+	for seed := range uint64(200) {
+		m := NewMem()
+		m.SetPageSize(8)
+		f := mustOpen(t, m, "/d/f", rw)
+		m.SyncDir("/d")
+		mustWrite(t, f, "abc")
+		f.Sync()
+		mustWrite(t, f, "defghijklmn")
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		if got := contents(t, m, "/d/f"); !bytes.HasPrefix(got, []byte("abc")) {
+			t.Fatalf("seed %d: synced bytes lost: %q", seed, got)
+		}
+	}
+}
+
 func TestMemNewFileNeedsDirSync(t *testing.T) {
 	m := NewMem()
 	f := mustOpen(t, m, "/d/f", rw)

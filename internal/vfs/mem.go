@@ -48,18 +48,25 @@ func (o Op) String() string {
 // way: a created file's name only becomes durable when its directory is
 // synced with SyncDir.
 //
-// Crash discards everything that is not durable, except that a random prefix
-// of unsynced appended bytes may survive, possibly with its last few bytes
-// zeroed or replaced by garbage. That models a torn write.
+// Crash discards everything that is not durable, except that unsynced
+// appended bytes may partly survive. Like a real kernel, Mem writes dirty
+// pages back in no particular order: the file may grow by any amount up to
+// what was written, each page of that growth independently either reached
+// disk or reads back as zeros, and the last few bytes may be garbage. That
+// models torn writes, including ones with holes in the middle.
 //
 // Mem is safe for concurrent use.
 type Mem struct {
-	mu      sync.Mutex
-	files   map[string]*inode // namespace as the running process sees it
-	durable map[string]*inode // namespace as it would be after a crash
-	epoch   uint64            // incremented by Crash; invalidates open handles
-	fault   func(op Op, name string) error
+	mu       sync.Mutex
+	files    map[string]*inode // namespace as the running process sees it
+	durable  map[string]*inode // namespace as it would be after a crash
+	epoch    uint64            // incremented by Crash; invalidates open handles
+	fault    func(op Op, name string) error
+	pageSize int
 }
+
+// DefaultPageSize is the page size Crash uses unless SetPageSize changes it.
+const DefaultPageSize = 4096
 
 var _ FS = (*Mem)(nil)
 
@@ -71,9 +78,22 @@ type inode struct {
 // NewMem returns an empty in-memory filesystem.
 func NewMem() *Mem {
 	return &Mem{
-		files:   make(map[string]*inode),
-		durable: make(map[string]*inode),
+		files:    make(map[string]*inode),
+		durable:  make(map[string]*inode),
+		pageSize: DefaultPageSize,
 	}
+}
+
+// SetPageSize sets the granularity at which Crash decides whether unsynced
+// data reached disk. Tests with small records use a small page size so that
+// a single write spans several pages.
+func (m *Mem) SetPageSize(n int) {
+	if n <= 0 {
+		panic("vfs: page size must be positive")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pageSize = n
 }
 
 // SetFault installs a hook called before every write, sync, truncate, and
@@ -145,14 +165,14 @@ func (m *Mem) Crash(rng *rand.Rand) {
 	// Sorted so rng is consumed in a deterministic order.
 	for _, name := range slices.Sorted(maps.Keys(m.durable)) {
 		ino := m.durable[name]
-		ino.data = survivingContents(ino, rng)
+		ino.data = survivingContents(ino, m.pageSize, rng)
 		ino.synced = bytes.Clone(ino.data)
 		files[name] = ino
 	}
 	m.files = files
 }
 
-func survivingContents(ino *inode, rng *rand.Rand) []byte {
+func survivingContents(ino *inode, pageSize int, rng *rand.Rand) []byte {
 	synced, data := ino.synced, ino.data
 	if !bytes.HasPrefix(data, synced) {
 		// The file was truncated or overwritten since the last sync. Model
@@ -162,11 +182,18 @@ func survivingContents(ino *inode, rng *rand.Rand) []byte {
 		}
 		return bytes.Clone(data)
 	}
-	// Only appends since the last sync: any prefix of the unsynced tail may
-	// have reached disk, and the last bytes of it may be torn.
+	// Only appends since the last sync. The new size is metadata written
+	// independently of the data, so pick any length between synced and
+	// current. Then each page overlapping the new region is either on disk
+	// or not. A page that was not written back keeps only its synced bytes.
 	tail := data[len(synced):]
 	k := rng.IntN(len(tail) + 1)
 	out := append(bytes.Clone(synced), tail[:k]...)
+	for page := len(synced) / pageSize * pageSize; page < len(out); page += pageSize {
+		if rng.IntN(3) == 0 {
+			clear(out[max(page, len(synced)):min(page+pageSize, len(out))])
+		}
+	}
 	if k > 0 && rng.IntN(4) == 0 {
 		torn := out[len(out)-1-rng.IntN(min(k, 16)):]
 		if rng.IntN(2) == 0 {
