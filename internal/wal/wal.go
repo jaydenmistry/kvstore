@@ -1,18 +1,20 @@
 // Package wal implements an append-only write-ahead log of checksummed
-// records.
+// records, written in atomic batches.
 //
 // The log knows nothing about Raft. Callers give each record a type and
 // interpret the contents themselves. The only promises are:
 //
 //   - Append returns nil only after its records are fsynced.
-//   - Open returns exactly the records whose Append succeeded, possibly
-//     followed by some records from a final Append that failed or was
-//     interrupted by a crash, in the order they were appended.
-//   - Open discards a torn final write, which was never acknowledged, but
-//     refuses to discard damaged data that has valid records after it.
+//   - Append is atomic across crashes: after recovery, either all of its
+//     records are present or none are.
+//   - Open returns the records of every Append that succeeded, possibly
+//     followed by those of a final Append that failed or was interrupted by
+//     a crash, in the order they were appended.
+//   - Open discards a torn final batch, which was never acknowledged, but
+//     refuses to discard damaged data that has a valid batch after it.
 //
-// One case is inherently ambiguous: damage confined to the final record
-// looks exactly like a torn write, so it is truncated even if that record was
+// One case is inherently ambiguous: damage confined to the final batch looks
+// exactly like a torn write, so it is discarded even if that batch was
 // acknowledged and later hit by bit rot. Telling the two apart would need
 // information from outside this file.
 package wal
@@ -107,24 +109,21 @@ func recoverLog(fsys vfs.FS, path string, f vfs.File) (*WAL, []Record, error) {
 	return &WAL{f: f}, recs, nil
 }
 
-// Append writes recs to the end of the log as one write and fsyncs it. It
-// returns nil only once all of recs are durable. Callers that need several
-// records to persist together (for example a Raft term update and the
-// entries that depend on it) should pass them in one call: the cost is a
-// single fsync.
-//
-// A crash during Append may leave any prefix of recs on disk, so all-or-
-// nothing atomicity across records is not guaranteed.
+// Append writes recs to the end of the log as one checksummed frame and
+// fsyncs it. It returns nil only once all of recs are durable, and a crash
+// never leaves only some of them on disk. Callers that need several records
+// to persist together (for example a Raft term update and the entries that
+// depend on it) should pass them in one call.
 //
 // If the write or fsync fails, the WAL becomes unusable: this and every later
 // call returns the same error.
 func (w *WAL) Append(recs ...Record) error {
 	var buf []byte
-	for _, r := range recs {
-		if err := validate(r); err != nil {
+	if len(recs) > 0 {
+		var err error
+		if buf, err = appendFrame(nil, recs); err != nil {
 			return fmt.Errorf("wal: append: %w", err)
 		}
-		buf = appendRecord(buf, r)
 	}
 
 	w.mu.Lock()
@@ -139,11 +138,11 @@ func (w *WAL) Append(recs ...Record) error {
 		return nil
 	}
 	if _, err := w.f.Write(buf); err != nil {
-		w.err = fmt.Errorf("wal: write failed, log must be reopened: %w", err)
+		w.err = fmt.Errorf("wal: write failed, log is unusable: %w", err)
 		return w.err
 	}
 	if err := w.f.Sync(); err != nil {
-		w.err = fmt.Errorf("wal: fsync failed, log must be reopened: %w", err)
+		w.err = fmt.Errorf("wal: fsync failed, log is unusable: %w", err)
 		return w.err
 	}
 	return nil

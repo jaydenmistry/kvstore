@@ -153,8 +153,8 @@ func TestAppendRejectsInvalidRecords(t *testing.T) {
 		if err := w.Append(good, Record{Type: 0}); !errors.Is(err, errBadType) {
 			t.Fatalf("type 0: err = %v, want errBadType", err)
 		}
-		if err := w.Append(Record{Type: 1, Data: make([]byte, MaxRecordSize+1)}); !errors.Is(err, errBadSize) {
-			t.Fatalf("oversized: err = %v, want errBadSize", err)
+		if err := w.Append(Record{Type: 1, Data: make([]byte, MaxBatchSize)}); !errors.Is(err, errTooBig) {
+			t.Fatalf("oversized: err = %v, want errTooBig", err)
 		}
 		// Validation errors are the caller's mistake, not an I/O failure:
 		// nothing was written, and the log stays usable.
