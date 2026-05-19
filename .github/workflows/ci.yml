@@ -20,6 +20,8 @@ jobs:
         run: make fmtcheck
       - name: vet
         run: make vet
+      - name: staticcheck
+        run: make staticcheck
       - name: test
         run: make race
       - name: build
