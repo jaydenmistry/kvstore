@@ -257,9 +257,6 @@ func (r *Raft) handleVoteResp(m Message) {
 	if r.state != Candidate {
 		return // a late response after we already won or stepped down
 	}
-	if _, seen := r.votes[m.From]; seen {
-		return
-	}
 	r.votes[m.From] = m.VoteGranted
 	if r.wonElection() {
 		r.becomeLeader()
