@@ -96,12 +96,13 @@ Create packages only when the phase that needs them begins.
 
 ## Commits
 
-- Before every commit: `gofmt -l .` is empty, `go vet ./...` and `go test -race ./...`
-  pass. Never commit failing tests.
+- Before every commit, `make check` (gofmt, vet, staticcheck, race tests) must
+  pass. Never commit failing tests. Do not pipe its output into another command
+  when gating a commit: the pipe hides its exit status.
 - Small, focused commits. Subject line only, no body.
 - No `Co-Authored-By` trailer and no "Generated with Claude Code" line.
 
 ## Commands
 
-`make build | test | race | vet | fmtcheck | staticcheck | lint | fuzz | clean`.
+`make build | test | race | vet | fmtcheck | staticcheck | lint | check | fuzz | clean`.
 `staticcheck` runs a pinned version through `go run`, which keeps it out of go.mod.
