@@ -1,8 +1,24 @@
 package raft
 
+import "errors"
+
 // None is the zero node ID. It means "no node": no vote cast, or no known
 // leader. Real node IDs must be nonzero.
 const None uint64 = 0
+
+// ErrNotLeader is returned by Propose on a node that is not the leader.
+var ErrNotLeader = errors.New("raft: not the leader")
+
+// Entry is one log entry. Indexes start at 1 and are contiguous.
+//
+// An entry with empty Data is a no-op: a new leader appends one at the start
+// of its term (§8) and the application should skip it. Data must not be
+// modified after it is handed to Raft or received from it.
+type Entry struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
 
 // State is a node's role (§5.1).
 type State uint8
@@ -75,8 +91,26 @@ type Message struct {
 
 	// MsgVoteResp: whether the vote was granted.
 	VoteGranted bool
+
+	// MsgApp: the entry just before Entries, which the follower must
+	// already have for the request to be accepted (§5.3), the entries to
+	// append, and the leader's commit index.
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []Entry
+	LeaderCommit uint64
+
 	// MsgAppResp: whether the follower accepted the request.
 	Success bool
+	// MsgAppResp, on success: the index of the last entry the request
+	// covered (PrevLogIndex + len(Entries)). The follower's log is now known
+	// to match the leader's up to here, and no further.
+	MatchIndex uint64
+	// MsgAppResp, on rejection: the PrevLogIndex that was rejected, so the
+	// leader can recognize and ignore rejections of requests it has since
+	// superseded, and a suggested next index to try.
+	RejectIndex uint64
+	HintIndex   uint64
 }
 
 // Transport sends messages to other nodes. Delivery is best-effort: messages
@@ -88,9 +122,11 @@ type Transport interface {
 
 // Status is a snapshot of a node's state, for tests and monitoring.
 type Status struct {
-	ID    uint64
-	Term  uint64
-	Vote  uint64
-	Lead  uint64
-	State State
+	ID        uint64
+	Term      uint64
+	Vote      uint64
+	Lead      uint64
+	State     State
+	Commit    uint64 // highest index known to be committed
+	LastIndex uint64 // index of the last entry in the log
 }

@@ -28,12 +28,17 @@ type testStorage struct {
 	fail error
 }
 
-func (s *testStorage) SaveHardState(hs HardState) error {
+func (s *testStorage) Save(hs *HardState, entries []Entry) error {
 	if s.fail != nil {
 		return s.fail
 	}
-	s.ev.log = append(s.ev.log, fmt.Sprintf("save term %d vote %d", hs.Term, hs.Vote))
-	return s.MemoryStorage.SaveHardState(hs)
+	if hs != nil {
+		s.ev.log = append(s.ev.log, fmt.Sprintf("save term %d vote %d", hs.Term, hs.Vote))
+	}
+	if len(entries) > 0 {
+		s.ev.log = append(s.ev.log, fmt.Sprintf("save entries %d-%d", entries[0].Index, entries[len(entries)-1].Index))
+	}
+	return s.MemoryStorage.Save(hs, entries)
 }
 
 const (
@@ -356,7 +361,9 @@ func TestLeaderStepsDownOnHigherTermVoteRequest(t *testing.T) {
 	r, _ := newNode(t, 1, 1, 2, 3)
 	tickUntilCampaign(t, r)
 	mustStep(t, r, Message{Type: MsgVoteResp, From: 2, To: 1, Term: 1, VoteGranted: true})
-	mustStep(t, r, Message{Type: MsgVote, From: 3, To: 1, Term: 2})
+	// The candidate's log must be as up to date as ours, which now holds
+	// the leader's no-op at index 1.
+	mustStep(t, r, Message{Type: MsgVote, From: 3, To: 1, Term: 2, LastLogIndex: 1, LastLogTerm: 1})
 	if s := r.Status(); s.State != Follower || s.Term != 2 || s.Vote != 3 {
 		t.Fatalf("after higher-term MsgVote: %+v, want follower in term 2 voting for 3", s)
 	}

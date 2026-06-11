@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"reflect"
 	"slices"
 	"testing"
 
@@ -29,7 +30,7 @@ func TestDeliversAfterOneTick(t *testing.T) {
 	n.Endpoint(1).Send(raft.Message{Type: raft.MsgVote, To: 2, Term: 7})
 	n.Tick(func(m raft.Message) { got = append(got, m) })
 	want := raft.Message{Type: raft.MsgVote, From: 1, To: 2, Term: 7}
-	if len(got) != 1 || got[0] != want {
+	if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 		t.Fatalf("delivered %+v, want [%+v]", got, want)
 	}
 	if n.InFlight() != 0 {
