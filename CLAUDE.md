@@ -75,7 +75,7 @@ Create packages only when the phase that needs them begins.
   no reliance on real timing.
 - WAL tests run against both `vfs.Mem` and real files in `t.TempDir()`.
 - Prefer property-style tests over many seeds for crash and partition scenarios.
-- Raft cluster tests (`internal/raft/cluster_test.go`) run every node on the
+- Raft cluster tests (harness in `internal/raft/harness_test.go`) run every node on the
   simulated `transport.Network` from one goroutine and check safety invariants
   after every `Step` and `Tick`, not just at the end.
 - When adding a safety test, plant the bug it targets in a scratch copy and confirm
