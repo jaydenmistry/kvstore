@@ -22,8 +22,11 @@ import (
 	"slices"
 )
 
-// DefaultMaxEntriesPerMessage is used when Config.MaxEntriesPerMessage is 0.
-const DefaultMaxEntriesPerMessage = 64
+// Defaults for Config fields left at zero.
+const (
+	DefaultMaxEntriesPerMessage = 64
+	DefaultMaxBytesPerMessage   = 1 << 20
+)
 
 // Config configures a Raft node.
 type Config struct {
@@ -43,6 +46,11 @@ type Config struct {
 
 	// MaxEntriesPerMessage caps the entries in one AppendEntries request.
 	MaxEntriesPerMessage int
+	// MaxBytesPerMessage caps the total Data size of the entries in one
+	// AppendEntries request. A single larger entry is still sent, alone.
+	// The follower saves a whole request in one Storage.Save, so this also
+	// bounds the size of that write.
+	MaxBytesPerMessage int
 
 	Storage   Storage
 	Transport Transport
@@ -63,8 +71,8 @@ func (c *Config) validate() error {
 		return errors.New("raft: duplicate peer ID")
 	case c.HeartbeatTick <= 0 || c.ElectionTick <= c.HeartbeatTick:
 		return errors.New("raft: need 0 < HeartbeatTick < ElectionTick")
-	case c.MaxEntriesPerMessage < 0:
-		return errors.New("raft: MaxEntriesPerMessage must not be negative")
+	case c.MaxEntriesPerMessage < 0 || c.MaxBytesPerMessage < 0:
+		return errors.New("raft: message limits must not be negative")
 	case c.Storage == nil || c.Transport == nil:
 		return errors.New("raft: Storage and Transport are required")
 	}
@@ -108,6 +116,7 @@ type Raft struct {
 	electionTick              int
 	heartbeatTick             int
 	maxMsgEntries             int
+	maxMsgBytes               int
 	randomizedElectionTimeout int
 	electionElapsed           int // follower and candidate only
 	heartbeatElapsed          int // leader only
@@ -144,6 +153,10 @@ func New(cfg Config) (*Raft, error) {
 	if maxEntries == 0 {
 		maxEntries = DefaultMaxEntriesPerMessage
 	}
+	maxBytes := cfg.MaxBytesPerMessage
+	if maxBytes == 0 {
+		maxBytes = DefaultMaxBytesPerMessage
+	}
 	r := &Raft{
 		id:            cfg.ID,
 		peers:         slices.Sorted(slices.Values(cfg.Peers)),
@@ -157,6 +170,7 @@ func New(cfg Config) (*Raft, error) {
 		electionTick:  cfg.ElectionTick,
 		heartbeatTick: cfg.HeartbeatTick,
 		maxMsgEntries: maxEntries,
+		maxMsgBytes:   maxBytes,
 	}
 	r.resetElectionTimer()
 	return r, nil
@@ -492,6 +506,14 @@ func (r *Raft) sendAppend(to uint64) {
 	prev := r.next[to] - 1
 	prevTerm, _ := r.termAt(prev)
 	end := min(r.lastIndex(), prev+uint64(r.maxMsgEntries))
+	size := 0
+	for i := prev; i < end; i++ {
+		size += len(r.log[i].Data)
+		if size > r.maxMsgBytes && i > prev {
+			end = i
+			break
+		}
+	}
 	r.send(Message{
 		Type:         MsgApp,
 		To:           to,

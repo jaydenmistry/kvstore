@@ -278,6 +278,36 @@ func TestLeaderSendsBatchesUntilCaughtUp(t *testing.T) {
 	}
 }
 
+func TestLeaderCapsBatchBytes(t *testing.T) {
+	r, st := newNode(t, 1, 1, 2, 3)
+	r.maxMsgBytes = 10
+	makeLeader(t, r) // no-op at 1
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 1})
+	for _, d := range []string{"aaaa", "bbbb", "cccc", "dddddddddddddddd", "e"} {
+		if _, _, err := r.Propose([]byte(d)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	takeSent(st)
+	var got []string
+	for range 4 {
+		r.sendAppend(2)
+		m := onlyMessage(t, st)
+		var batch []string
+		for _, e := range m.Entries {
+			batch = append(batch, string(e.Data))
+		}
+		got = append(got, strings.Join(batch, ","))
+		r.next[2] += uint64(len(m.Entries))
+	}
+	// 4+4 bytes fit in 10, a third entry would not. The oversized entry
+	// goes alone rather than never.
+	want := []string{"aaaa,bbbb", "cccc", "dddddddddddddddd", "e"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("batches %q, want %q", got, want)
+	}
+}
+
 func TestProposeErrors(t *testing.T) {
 	r, _ := newNode(t, 1, 1, 2, 3)
 	if _, _, err := r.Propose([]byte("x")); !errors.Is(err, ErrNotLeader) {
