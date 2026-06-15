@@ -6,7 +6,8 @@ import "errors"
 // leader. Real node IDs must be nonzero.
 const None uint64 = 0
 
-// ErrNotLeader is returned by Propose on a node that is not the leader.
+// ErrNotLeader is returned by Propose and ReadIndex on a node that is not the
+// leader.
 var ErrNotLeader = errors.New("raft: not the leader")
 
 // Entry is one log entry. Indexes start at 1 and are contiguous.
@@ -111,6 +112,12 @@ type Message struct {
 	// superseded, and a suggested next index to try.
 	RejectIndex uint64
 	HintIndex   uint64
+
+	// MsgApp: the leader's heartbeat round, echoed in the MsgAppResp. A
+	// response with round r proves the follower still accepted this leader
+	// when it received a request sent at round r, which is how ReadIndex
+	// confirms leadership.
+	Round uint64
 }
 
 // Transport sends messages to other nodes. Delivery is best-effort: messages
@@ -118,6 +125,19 @@ type Message struct {
 // these. Send must not block and must not call back into Raft.
 type Transport interface {
 	Send(m Message)
+}
+
+// ReadState is the outcome of a ReadIndex request.
+type ReadState struct {
+	// ID is the ID the caller passed to ReadIndex.
+	ID uint64
+	// Index is the read index: once every entry through Index has been
+	// applied, the state machine reflects every write that completed
+	// before the read was requested, and the read can be served from it.
+	Index uint64
+	// Err is ErrNotLeader if the node lost leadership before it could
+	// confirm the read. The read must then be retried on the new leader.
+	Err error
 }
 
 // Status is a snapshot of a node's state, for tests and monitoring.

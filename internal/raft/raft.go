@@ -6,6 +6,8 @@
 // Tick, called at a regular interval, Step, called for each message received
 // from another node, and Propose, called to add a command to the log on the
 // leader. Committed entries come out of TakeCommitted, in log order.
+// ReadIndex and TakeReadStates support linearizable reads that do not go
+// through the log.
 //
 // Raft persists state through Storage and sends messages through Transport
 // synchronously from inside those calls, always persisting before it sends
@@ -112,6 +114,15 @@ type Raft struct {
 	// itself, updated whenever it appends to its own log.
 	next  map[uint64]uint64
 	match map[uint64]uint64
+
+	// Leader only, for ReadIndex: the current heartbeat round, the highest
+	// round each peer has echoed back, and reads waiting for confirmation,
+	// in the order they were requested.
+	round uint64
+	acked map[uint64]uint64
+	reads []pendingRead
+	// readStates holds outcomes not yet returned by TakeReadStates.
+	readStates []ReadState
 
 	electionTick              int
 	heartbeatTick             int
@@ -225,6 +236,52 @@ func (r *Raft) TakeCommitted() []Entry {
 	ents := slices.Clone(r.log[r.applied:r.commit])
 	r.applied = r.commit
 	return ents
+}
+
+// ReadIndex starts a linearizable read on the leader (§8). The outcome is
+// returned later by TakeReadStates as a ReadState carrying id. Reading the
+// state machine is safe once it has applied every entry through the
+// ReadState's Index; draining TakeCommitted first always achieves that.
+//
+// A leader cannot answer from its own state right away: it may have been
+// deposed by a newer leader it has not heard from, which may already have
+// committed writes it lacks. The read is confirmed once two things hold:
+//
+//  1. The leader has committed an entry from its current term (its no-op).
+//     Before that its commit index may lag the cluster's, because entries
+//     from earlier terms cannot be counted as committed (§5.4.2).
+//  2. A majority has answered a heartbeat sent after the read was
+//     requested. A newer leader needs a majority's votes, and each of those
+//     voters had not yet left this term when it answered us, so the newer
+//     leader was elected after the read began. Writes it commits are
+//     concurrent with the read and may be left out. An answer to a
+//     heartbeat sent before the read proves nothing, which is why the read
+//     starts a new round.
+func (r *Raft) ReadIndex(id uint64) error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.state != Leader {
+		return ErrNotLeader
+	}
+	rd := pendingRead{id: id}
+	if r.committedCurrentTerm() {
+		rd.index = r.commit
+	}
+	r.round++
+	rd.round = r.round
+	r.reads = append(r.reads, rd)
+	r.broadcastAppend()
+	r.advanceReads() // a single-node cluster confirms at once
+	return r.err
+}
+
+// TakeReadStates returns the outcomes of ReadIndex requests resolved since
+// the previous call.
+func (r *Raft) TakeReadStates() []ReadState {
+	rs := r.readStates
+	r.readStates = nil
+	return rs
 }
 
 // Tick advances the node's logical clock by one tick. A follower or
@@ -388,7 +445,7 @@ func (r *Raft) handleAppend(m Message) {
 	// the new ones, with the same term. Log Matching then guarantees that
 	// everything up to it matches the leader too.
 	if m.PrevLogIndex > r.lastIndex() {
-		r.send(Message{Type: MsgAppResp, To: m.From, RejectIndex: m.PrevLogIndex, HintIndex: r.lastIndex() + 1})
+		r.send(Message{Type: MsgAppResp, To: m.From, RejectIndex: m.PrevLogIndex, HintIndex: r.lastIndex() + 1, Round: m.Round})
 		return
 	}
 	if t, _ := r.termAt(m.PrevLogIndex); t != m.PrevLogTerm {
@@ -402,7 +459,7 @@ func (r *Raft) handleAppend(m Message) {
 			}
 			hint--
 		}
-		r.send(Message{Type: MsgAppResp, To: m.From, RejectIndex: m.PrevLogIndex, HintIndex: hint})
+		r.send(Message{Type: MsgAppResp, To: m.From, RejectIndex: m.PrevLogIndex, HintIndex: hint, Round: m.Round})
 		return
 	}
 
@@ -430,7 +487,7 @@ func (r *Raft) handleAppend(m Message) {
 	if c := min(m.LeaderCommit, lastNew); c > r.commit {
 		r.commit = c
 	}
-	r.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew})
+	r.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew, Round: m.Round})
 }
 
 func (r *Raft) handleAppendResp(m Message) {
@@ -438,6 +495,12 @@ func (r *Raft) handleAppendResp(m Message) {
 		return
 	}
 	p := m.From
+	// Any response in this term, success or rejection, shows the follower
+	// accepted us as leader when it received that round.
+	if m.Round > r.acked[p] {
+		r.acked[p] = m.Round
+		r.advanceReads()
+	}
 	if m.Success {
 		// Responses can arrive out of order. matchIndex only moves forward,
 		// so an old success cannot undo a newer one.
@@ -487,6 +550,51 @@ func (r *Raft) maybeCommit() {
 		return
 	}
 	r.commit = n
+	r.advanceReads()
+}
+
+func (r *Raft) committedCurrentTerm() bool {
+	t, _ := r.termAt(r.commit)
+	return t == r.term
+}
+
+type pendingRead struct {
+	id    uint64
+	round uint64 // heartbeat round a majority must answer
+	index uint64 // read index; 0 until an entry from this term commits
+}
+
+// advanceReads resolves the pending reads that are now confirmed (see
+// ReadIndex).
+func (r *Raft) advanceReads() {
+	if len(r.reads) == 0 || !r.committedCurrentTerm() {
+		return
+	}
+	// The highest round answered by a majority, counting ourselves as
+	// having answered every round.
+	rounds := make([]uint64, 0, len(r.peers))
+	for _, p := range r.peers {
+		if p == r.id {
+			rounds = append(rounds, r.round)
+		} else {
+			rounds = append(rounds, r.acked[p])
+		}
+	}
+	slices.Sort(rounds)
+	confirmed := rounds[(len(rounds)-1)/2]
+	// Rounds increase along r.reads, so the confirmed reads are a prefix.
+	for len(r.reads) > 0 && r.reads[0].round <= confirmed {
+		rd := r.reads[0]
+		r.reads = r.reads[1:]
+		if rd.index == 0 {
+			// Requested before this term's first commit. The current commit
+			// index is at least the commit index of the cluster when the
+			// read arrived, and entries committed since are concurrent with
+			// the read, so it is a valid read index.
+			rd.index = r.commit
+		}
+		r.readStates = append(r.readStates, ReadState{ID: rd.id, Index: rd.index})
+	}
 }
 
 // appendAsLeader adds e to the leader's own log, then sends it out.
@@ -524,6 +632,7 @@ func (r *Raft) sendAppend(to uint64) {
 		// follower.
 		Entries:      slices.Clone(r.log[prev:end]),
 		LeaderCommit: r.commit,
+		Round:        r.round,
 	})
 }
 
@@ -548,6 +657,12 @@ func (r *Raft) becomeFollower(term, lead uint64) bool {
 	if r.state == Leader {
 		// A leader runs no election timer, so start a fresh one.
 		r.resetElectionTimer()
+		// Unconfirmed reads fail: we can no longer show that no newer
+		// leader exists. The caller retries them on the new leader.
+		for _, rd := range r.reads {
+			r.readStates = append(r.readStates, ReadState{ID: rd.id, Err: ErrNotLeader})
+		}
+		r.reads, r.round = nil, 0
 	}
 	r.state = Follower
 	r.lead = lead
@@ -567,6 +682,7 @@ func (r *Raft) becomeLeader() {
 		r.next[p] = r.lastIndex() + 1
 	}
 	r.match[r.id] = r.lastIndex()
+	r.acked = make(map[uint64]uint64, len(r.peers))
 	// §8: start the term with a no-op entry. Entries from earlier terms can
 	// only commit once an entry from this term does (see maybeCommit), so
 	// without it they could wait indefinitely for the next client command.
