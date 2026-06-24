@@ -34,6 +34,7 @@ check: lint race
 
 fuzz:
 	$(GO) test ./internal/wal -run='^$$' -fuzz=FuzzDecodeAll -fuzztime=$(FUZZTIME)
+	$(GO) test ./internal/kv -run='^$$' -fuzz=FuzzDecodeCommand -fuzztime=$(FUZZTIME)
 
 clean:
 	rm -rf $(BIN)
