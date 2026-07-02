@@ -88,6 +88,9 @@ func NewReplica(r *raft.Raft, requestTimeout int) *Replica {
 // Raft returns the Raft node, for status and tests.
 func (p *Replica) Raft() *raft.Raft { return p.raft }
 
+// Applied returns the index of the last entry applied to the state machine.
+func (p *Replica) Applied() uint64 { return p.sm.Applied() }
+
 // Submit starts a request. done is called exactly once with the outcome,
 // either before Submit returns or during a later call to Submit, Tick, or
 // Step. done must not call back into the Replica.
