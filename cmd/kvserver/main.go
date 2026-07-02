@@ -1,12 +1,170 @@
-// Command kvserver runs one node of the replicated key-value store.
+// Command kvserver runs one node of a kvstore cluster.
+//
+//	kvserver -id 1 -data /var/lib/kvstore \
+//	    -peer 1=10.0.0.1:7001,10.0.0.1:8001 \
+//	    -peer 2=10.0.0.2:7001,10.0.0.2:8001 \
+//	    -peer 3=10.0.0.3:7001,10.0.0.3:8001
+//
+// Each -peer gives a member's Raft address and client API address. Every
+// node needs the same list, including itself.
+//
+// Exit status is 0 after SIGINT or SIGTERM, 2 for bad usage, 1 if the node
+// could not start, and 3 (exitFatal) if storage or the state machine failed.
+// Do not restart automatically after exit status 3: a failed fsync may have
+// left the page cache claiming data that never reached disk, so drop the
+// host's page cache or reboot it first.
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/jaydenmistry/kvstore/internal/server"
+	"github.com/jaydenmistry/kvstore/internal/vfs"
 )
 
-func main() {
-	fmt.Fprintln(os.Stderr, "kvserver: not implemented yet")
-	os.Exit(1)
+const (
+	exitError = 1
+	exitUsage = 2
+	exitFatal = 3
+)
+
+func main() { os.Exit(run()) }
+
+func run() int {
+	peers := peerFlag{}
+	id := flag.Uint64("id", 0, "this node's `ID`")
+	flag.Var(peers, "peer", "cluster member as `ID=RAFT_ADDR,API_ADDR`; repeat for every member, including this node")
+	dataDir := flag.String("data", "", "data `directory`")
+	tick := flag.Duration("tick", server.DefaultTickInterval, "Raft tick `interval`")
+	flag.Parse()
+	if flag.NArg() > 0 || *id == 0 || *dataDir == "" || len(peers) == 0 {
+		fmt.Fprintln(os.Stderr, "kvserver: -id, -data, and -peer are required")
+		flag.Usage()
+		return exitUsage
+	}
+	self, ok := peers[*id]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "kvserver: no -peer entry for this node's ID %d\n", *id)
+		return exitUsage
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	if err := mkdirDurable(*dataDir); err != nil {
+		log.Error("creating data directory", "err", err)
+		return exitError
+	}
+	raftLn, err := net.Listen("tcp", self.Raft)
+	if err != nil {
+		log.Error("listening for Raft traffic", "err", err)
+		return exitError
+	}
+	apiLn, err := net.Listen("tcp", self.API)
+	if err != nil {
+		log.Error("listening for clients", "err", err)
+		return exitError
+	}
+	s, err := server.New(server.Config{
+		ID:           *id,
+		Peers:        peers,
+		DataDir:      *dataDir,
+		TickInterval: *tick,
+		Logger:       log,
+	}, raftLn, apiLn)
+	if err != nil {
+		return failed(log, err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := s.Run(ctx); err != nil {
+		return failed(log, err)
+	}
+	log.Info("node stopped")
+	return 0
+}
+
+func failed(log *slog.Logger, err error) int {
+	if errors.Is(err, server.ErrFatal) {
+		log.Error("node stopped on a fatal error; do not restart it before dropping the host page cache or rebooting",
+			"err", err, "exit", exitFatal)
+		return exitFatal
+	}
+	log.Error("node failed", "err", err)
+	return exitError
+}
+
+// mkdirDurable creates dir and any missing parents, and fsyncs the parent of
+// each, so the directory entries survive a power loss. The WAL syncs the
+// directory holding its file, but not that directory's own entry in its
+// parent: without this, a power cut soon after a node's first start could
+// remove the whole data directory, and the node would restart having
+// forgotten votes and entries it had acknowledged.
+func mkdirDurable(dir string) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(d); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		missing = append(missing, d)
+		if d == filepath.Dir(d) {
+			break
+		}
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// Sync the parent of every directory created, and always dir's own
+	// parent: an operator may have created dir without syncing it. All of
+	// them finish before the WAL is opened, so their order does not matter.
+	toSync := []string{filepath.Dir(dir)}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if p := filepath.Dir(missing[i]); p != toSync[0] {
+			toSync = append(toSync, p)
+		}
+	}
+	for _, d := range toSync {
+		if err := (vfs.OS{}).SyncDir(d); err != nil {
+			return fmt.Errorf("syncing %s: %w", d, err)
+		}
+	}
+	return nil
+}
+
+// peerFlag collects -peer flags.
+type peerFlag map[uint64]server.Peer
+
+func (p peerFlag) String() string { return fmt.Sprint(map[uint64]server.Peer(p)) }
+
+func (p peerFlag) Set(s string) error {
+	idStr, addrs, ok := strings.Cut(s, "=")
+	raftAddr, apiAddr, ok2 := strings.Cut(addrs, ",")
+	if !ok || !ok2 || raftAddr == "" || apiAddr == "" {
+		return errors.New("want ID=RAFT_ADDR,API_ADDR")
+	}
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id == 0 {
+		return fmt.Errorf("bad node ID %q", idStr)
+	}
+	if _, dup := p[id]; dup {
+		return fmt.Errorf("node %d listed twice", id)
+	}
+	p[id] = server.Peer{Raft: raftAddr, API: apiAddr}
+	return nil
 }

@@ -174,6 +174,7 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) loop(ctx context.Context) error {
 	ticker := time.NewTicker(s.cfg.TickInterval)
 	defer ticker.Stop()
+	var last raft.Status
 	for {
 		var err error
 		select {
@@ -188,6 +189,10 @@ func (s *Server) loop(ctx context.Context) error {
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrFatal, err)
+		}
+		if st := s.replica.Raft().Status(); st.State != last.State || st.Lead != last.Lead {
+			s.log.Info("raft state changed", "state", st.State, "term", st.Term, "leader", st.Lead)
+			last = st
 		}
 	}
 }
