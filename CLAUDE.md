@@ -63,6 +63,12 @@ Create packages only when the phase that needs them begins.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
+- Snapshots (§7) hold only applied state, and must include the dedup sessions.
+  `DiskStorage.SaveSnapshot` writes the snapshot file, then rewrites the WAL
+  (each step: temp file, fsync, rename, fsync dir). A crash between the steps
+  is finished by `OpenDiskStorage` using the same keep-or-drop rule as
+  InstallSnapshot (Figure 13). A follower ignores a snapshot at or below its
+  commit index. Snapshots travel whole in one message (no chunking).
 - `kv.Replica` and `raft.Raft` are single-threaded; in `kvserver` only the loop
   goroutine touches them.
 - Recovery may discard only a damaged final frame, which was never acknowledged
@@ -86,6 +92,10 @@ Create packages only when the phase that needs them begins.
 - Tests are deterministic: seeded RNGs (log the seed on failure), no `time.Sleep`,
   no reliance on real timing.
 - WAL tests run against both `vfs.Mem` and real files in `t.TempDir()`.
+- `vfs.Mem` loses or keeps unsynced name changes (create, rename, remove) per
+  directory on a crash, so recovery code is tested against both outcomes.
+- Storage crash tests fail every filesystem operation in turn (fault hook),
+  then `Crash`, and require the old state or the new one, nothing in between.
 - Prefer property-style tests over many seeds for crash and partition scenarios.
 - Raft cluster tests (harness in `internal/raft/harness_test.go`) run every node on the
   simulated `transport.Network` from one goroutine and check safety invariants
