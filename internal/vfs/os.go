@@ -27,6 +27,10 @@ func (OS) SyncDir(dir string) error {
 	return d.Close()
 }
 
+func (OS) Rename(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }
+
+func (OS) Remove(name string) error { return os.Remove(name) }
+
 type osFile struct{ *os.File }
 
 func (f osFile) Size() (int64, error) {

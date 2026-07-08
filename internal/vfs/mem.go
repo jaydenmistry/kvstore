@@ -25,6 +25,8 @@ const (
 	OpSync
 	OpTruncate
 	OpSyncDir
+	OpRename
+	OpRemove
 )
 
 func (o Op) String() string {
@@ -37,6 +39,10 @@ func (o Op) String() string {
 		return "truncate"
 	case OpSyncDir:
 		return "syncdir"
+	case OpRename:
+		return "rename"
+	case OpRemove:
+		return "remove"
 	}
 	return "unknown"
 }
@@ -45,8 +51,11 @@ func (o Op) String() string {
 //
 // Each file has two versions of its contents: what the running process sees,
 // and what has been made durable by Sync. The namespace is modeled the same
-// way: a created file's name only becomes durable when its directory is
-// synced with SyncDir.
+// way: names created, renamed, or removed in a directory become durable when
+// the directory is synced with SyncDir. Until then, a crash keeps either all
+// of that directory's unsynced name changes or none of them. (A real
+// filesystem journals metadata changes in order, so this is a
+// simplification, but it produces both outcomes a caller must handle.)
 //
 // Crash discards everything that is not durable, except that unsynced
 // appended bytes may partly survive. Like a real kernel, Mem writes dirty
@@ -96,8 +105,8 @@ func (m *Mem) SetPageSize(n int) {
 	m.pageSize = n
 }
 
-// SetFault installs a hook called before every write, sync, truncate, and
-// directory sync. If it returns an error, the operation fails with that error
+// SetFault installs a hook called before every write, sync, truncate,
+// directory sync, rename, and remove. If it returns an error, the operation fails with that error
 // and has no effect. The hook runs with Mem's lock held and must not call
 // back into Mem. Pass nil to remove it.
 func (m *Mem) SetFault(fn func(op Op, name string) error) {
@@ -153,23 +162,80 @@ func (m *Mem) SyncDir(dir string) error {
 	return nil
 }
 
+func (m *Mem) Rename(oldpath, newpath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	oldpath, newpath = filepath.Clean(oldpath), filepath.Clean(newpath)
+	if filepath.Dir(oldpath) != filepath.Dir(newpath) {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: errors.New("vfs: Mem renames only within a directory")}
+	}
+	ino, ok := m.files[oldpath]
+	if !ok {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: fs.ErrNotExist}
+	}
+	if err := m.injected(OpRename, oldpath); err != nil {
+		return err
+	}
+	delete(m.files, oldpath)
+	m.files[newpath] = ino
+	return nil
+}
+
+func (m *Mem) Remove(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	name = filepath.Clean(name)
+	if _, ok := m.files[name]; !ok {
+		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
+	}
+	if err := m.injected(OpRemove, name); err != nil {
+		return err
+	}
+	delete(m.files, name)
+	return nil
+}
+
 // Crash simulates a power failure followed by a restart. Every open handle
-// becomes stale, and each file's contents are replaced by what could have
+// becomes stale. Each directory keeps either its durable names or its
+// current ones, and each file's contents are replaced by what could have
 // survived on disk. All randomness comes from rng, so a given seed always
 // produces the same outcome.
 func (m *Mem) Crash(rng *rand.Rand) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.epoch++
-	files := make(map[string]*inode, len(m.durable))
+	byDir := func(ns map[string]*inode) map[string]map[string]*inode {
+		out := map[string]map[string]*inode{}
+		for name, ino := range ns {
+			d := filepath.Dir(name)
+			if out[d] == nil {
+				out[d] = map[string]*inode{}
+			}
+			out[d][name] = ino
+		}
+		return out
+	}
+	durable, current := byDir(m.durable), byDir(m.files)
+	dirs := maps.Clone(durable)
+	maps.Copy(dirs, current)
+	names := map[string]*inode{}
 	// Sorted so rng is consumed in a deterministic order.
-	for _, name := range slices.Sorted(maps.Keys(m.durable)) {
-		ino := m.durable[name]
+	for _, d := range slices.Sorted(maps.Keys(dirs)) {
+		ns := durable[d]
+		if !maps.Equal(durable[d], current[d]) && rng.IntN(2) == 0 {
+			ns = current[d]
+		}
+		maps.Copy(names, ns)
+	}
+	files := make(map[string]*inode, len(names))
+	for _, name := range slices.Sorted(maps.Keys(names)) {
+		ino := names[name]
 		ino.data = survivingContents(ino, m.pageSize, rng)
 		ino.synced = bytes.Clone(ino.data)
 		files[name] = ino
 	}
 	m.files = files
+	m.durable = maps.Clone(files)
 }
 
 func survivingContents(ino *inode, pageSize int, rng *rand.Rand) []byte {

@@ -164,41 +164,162 @@ func TestMemCrashKeepsSyncedPartOfPage(t *testing.T) {
 	}
 }
 
-func TestMemNewFileNeedsDirSync(t *testing.T) {
-	m := NewMem()
-	f := mustOpen(t, m, "/d/f", rw)
-	mustWrite(t, f, "data")
-	if err := f.Sync(); err != nil {
+// exists reports whether name can be opened.
+func exists(t *testing.T, m *Mem, name string) bool {
+	t.Helper()
+	f, err := m.OpenFile(name, os.O_RDONLY, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	m.Crash(rand.New(rand.NewPCG(1, 0)))
-	if _, err := m.OpenFile("/d/f", os.O_RDONLY, 0); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("file synced without dir sync survived crash: err = %v", err)
-	}
+	f.Close()
+	return true
+}
 
-	f = mustOpen(t, m, "/d/f", rw)
-	mustWrite(t, f, "data")
-	f.Sync()
-	if err := m.SyncDir("/d"); err != nil {
-		t.Fatal(err)
+func TestMemNewFileNeedsDirSync(t *testing.T) {
+	// Without a directory sync, a new file may or may not survive, even if
+	// its contents were synced. After one, it always does.
+	var sawKept, sawLost bool
+	for seed := range uint64(50) {
+		m := NewMem()
+		f := mustOpen(t, m, "/d/f", rw)
+		mustWrite(t, f, "data")
+		if err := f.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		if exists(t, m, "/d/f") {
+			sawKept = true
+			if got := contents(t, m, "/d/f"); string(got) != "data" {
+				t.Fatalf("seed %d: kept file holds %q", seed, got)
+			}
+		} else {
+			sawLost = true
+		}
+
+		f = mustOpen(t, m, "/d/f", rw|os.O_TRUNC)
+		mustWrite(t, f, "data")
+		f.Sync()
+		if err := m.SyncDir("/d"); err != nil {
+			t.Fatal(err)
+		}
+		m.Crash(rand.New(rand.NewPCG(seed, 1)))
+		if got := contents(t, m, "/d/f"); string(got) != "data" {
+			t.Fatalf("seed %d: after dir sync and crash: %q, want %q", seed, got, "data")
+		}
 	}
-	m.Crash(rand.New(rand.NewPCG(1, 0)))
-	if got := contents(t, m, "/d/f"); string(got) != "data" {
-		t.Fatalf("after dir sync and crash: %q, want %q", got, "data")
+	if !sawKept || !sawLost {
+		t.Fatalf("unsynced create: kept=%v lost=%v, want both outcomes", sawKept, sawLost)
 	}
 }
 
 func TestMemSyncDirOnlyAffectsThatDir(t *testing.T) {
-	m := NewMem()
-	mustOpen(t, m, "/a/f", rw).Close()
-	mustOpen(t, m, "/b/f", rw).Close()
-	m.SyncDir("/a")
-	m.Crash(rand.New(rand.NewPCG(1, 0)))
-	if _, err := m.OpenFile("/a/f", os.O_RDONLY, 0); err != nil {
-		t.Fatalf("/a/f: %v", err)
+	var sawLost bool
+	for seed := range uint64(50) {
+		m := NewMem()
+		mustOpen(t, m, "/a/f", rw).Close()
+		mustOpen(t, m, "/b/f", rw).Close()
+		m.SyncDir("/a")
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		if !exists(t, m, "/a/f") {
+			t.Fatalf("seed %d: /a/f lost although /a was synced", seed)
+		}
+		sawLost = sawLost || !exists(t, m, "/b/f")
 	}
-	if _, err := m.OpenFile("/b/f", os.O_RDONLY, 0); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("/b/f survived without its dir being synced: err = %v", err)
+	if !sawLost {
+		t.Fatal("/b/f always survived without its dir being synced")
+	}
+}
+
+func TestMemRenameIsAtomic(t *testing.T) {
+	// The write-to-temp-then-rename pattern. Before the directory sync, a
+	// crash leaves either the old file or the new one under the name,
+	// never a mix; after it, always the new one.
+	var sawOld, sawNew bool
+	for seed := range uint64(50) {
+		m := NewMem()
+		f := mustOpen(t, m, "/d/f", rw)
+		mustWrite(t, f, "old")
+		f.Sync()
+		m.SyncDir("/d")
+		tmp := mustOpen(t, m, "/d/f.tmp", rw)
+		mustWrite(t, tmp, "new contents")
+		tmp.Sync()
+		if err := m.Rename("/d/f.tmp", "/d/f"); err != nil {
+			t.Fatal(err)
+		}
+		if got := contents(t, m, "/d/f"); string(got) != "new contents" || exists(t, m, "/d/f.tmp") {
+			t.Fatalf("before crash: f = %q, tmp exists = %v", got, exists(t, m, "/d/f.tmp"))
+		}
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		switch got := string(contents(t, m, "/d/f")); got {
+		case "old":
+			sawOld = true // the temporary file may or may not exist
+		case "new contents":
+			sawNew = true
+			if exists(t, m, "/d/f.tmp") {
+				t.Fatalf("seed %d: rename kept but the temporary file is still there", seed)
+			}
+		default:
+			t.Fatalf("seed %d: f = %q", seed, got)
+		}
+
+		tmp = mustOpen(t, m, "/d/g.tmp", rw)
+		mustWrite(t, tmp, "g")
+		tmp.Sync()
+		m.Rename("/d/g.tmp", "/d/g")
+		m.SyncDir("/d")
+		m.Crash(rand.New(rand.NewPCG(seed, 1)))
+		if got := contents(t, m, "/d/g"); string(got) != "g" || exists(t, m, "/d/g.tmp") {
+			t.Fatalf("seed %d: after dir sync: g = %q, tmp exists = %v", seed, got, exists(t, m, "/d/g.tmp"))
+		}
+	}
+	if !sawOld || !sawNew {
+		t.Fatalf("unsynced rename: old=%v new=%v, want both outcomes", sawOld, sawNew)
+	}
+}
+
+func TestMemRemoveNeedsDirSync(t *testing.T) {
+	var sawBack bool
+	for seed := range uint64(50) {
+		m := NewMem()
+		mustOpen(t, m, "/d/f", rw).Close()
+		m.SyncDir("/d")
+		if err := m.Remove("/d/f"); err != nil {
+			t.Fatal(err)
+		}
+		if exists(t, m, "/d/f") {
+			t.Fatal("removed file still visible")
+		}
+		m.Crash(rand.New(rand.NewPCG(seed, 0)))
+		sawBack = sawBack || exists(t, m, "/d/f")
+		if exists(t, m, "/d/f") {
+			m.Remove("/d/f")
+		}
+		m.SyncDir("/d")
+		m.Crash(rand.New(rand.NewPCG(seed, 1)))
+		if exists(t, m, "/d/f") {
+			t.Fatalf("seed %d: removed file came back after dir sync", seed)
+		}
+	}
+	if !sawBack {
+		t.Fatal("unsynced remove always survived the crash")
+	}
+}
+
+func TestMemRenameErrors(t *testing.T) {
+	m := NewMem()
+	if err := m.Rename("/d/missing", "/d/x"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rename of missing file: %v", err)
+	}
+	mustOpen(t, m, "/d/f", rw).Close()
+	if err := m.Rename("/d/f", "/e/f"); err == nil {
+		t.Fatal("rename across directories succeeded")
+	}
+	if err := m.Remove("/d/missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("remove of missing file: %v", err)
 	}
 }
 

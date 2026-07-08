@@ -41,3 +41,25 @@ func TestOSRoundTrip(t *testing.T) {
 		t.Fatalf("read %q, want %q", buf, "hell")
 	}
 }
+
+func TestOSRenameAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	f, err := OS{}.OpenFile(a, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := (OS{}).Rename(a, b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(a); !os.IsNotExist(err) {
+		t.Fatalf("old name still exists: %v", err)
+	}
+	if err := (OS{}).Remove(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(b); !os.IsNotExist(err) {
+		t.Fatalf("removed file still exists: %v", err)
+	}
+}

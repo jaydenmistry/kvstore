@@ -25,8 +25,14 @@ type File interface {
 type FS interface {
 	// OpenFile opens name with the same flag semantics as os.OpenFile.
 	OpenFile(name string, flag int, perm os.FileMode) (File, error)
-	// SyncDir fsyncs the directory dir. A newly created file's name is not
-	// guaranteed to survive a crash until its parent directory is synced,
-	// even if the file itself was synced.
+	// SyncDir fsyncs the directory dir. A change to the names in a
+	// directory (a file created, renamed, or removed) is not guaranteed to
+	// survive a crash until the directory is synced, even if the file itself
+	// was synced. Until then it may survive or not.
 	SyncDir(dir string) error
+	// Rename atomically replaces newpath with oldpath, as os.Rename. Both
+	// must be in the same directory.
+	Rename(oldpath, newpath string) error
+	// Remove deletes the file name.
+	Remove(name string) error
 }
