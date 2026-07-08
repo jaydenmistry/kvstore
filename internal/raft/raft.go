@@ -7,7 +7,9 @@
 // from another node, and Propose, called to add a command to the log on the
 // leader. Committed entries come out of TakeCommitted, in log order.
 // ReadIndex and TakeReadStates support linearizable reads that do not go
-// through the log.
+// through the log. Compact replaces applied entries with a snapshot of the
+// application's state; a snapshot to restore, received from the leader or
+// loaded at startup, comes out of TakeSnapshot.
 //
 // Raft persists state through Storage and sends messages through Transport
 // synchronously from inside those calls, always persisting before it sends
@@ -94,13 +96,19 @@ type Raft struct {
 	// durably saved the new values; see persist and saveEntries.
 	term uint64
 	vote uint64
-	log  []Entry // see log.go
+	log  logSuffix // see log.go
+	// snapshot is the latest snapshot, kept to send to followers that need
+	// entries it replaced.
+	snapshot Snapshot
 
 	// Volatile state (Figure 2). Not persisted: after a restart the commit
 	// index is relearned from the leader and entries are applied again
 	// from the start.
 	commit  uint64
-	applied uint64 // highest index returned by TakeCommitted
+	applied uint64 // highest index returned by TakeCommitted or TakeSnapshot
+	// pendingSnap is a snapshot the application must restore before it
+	// applies anything more.
+	pendingSnap *Snapshot
 
 	state State
 	lead  uint64 // leader of the current term, if known
@@ -144,13 +152,16 @@ func New(cfg Config) (*Raft, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	hs, log, err := cfg.Storage.Load()
+	hs, snap, ents, err := cfg.Storage.Load()
 	if err != nil {
 		return nil, fmt.Errorf("raft: loading state: %w", err)
 	}
-	for i, e := range log {
-		if e.Index != uint64(i)+1 {
-			return nil, fmt.Errorf("raft: stored entry %d has index %d", i+1, e.Index)
+	if snap.Term > hs.Term {
+		return nil, fmt.Errorf("raft: stored snapshot has term %d, after current term %d", snap.Term, hs.Term)
+	}
+	for i, e := range ents {
+		if want := snap.Index + uint64(i) + 1; e.Index != want {
+			return nil, fmt.Errorf("raft: stored entry %d has index %d", want, e.Index)
 		}
 		if e.Term > hs.Term {
 			return nil, fmt.Errorf("raft: stored entry %d has term %d, after current term %d", e.Index, e.Term, hs.Term)
@@ -169,19 +180,27 @@ func New(cfg Config) (*Raft, error) {
 		maxBytes = DefaultMaxBytesPerMessage
 	}
 	r := &Raft{
-		id:            cfg.ID,
-		peers:         slices.Sorted(slices.Values(cfg.Peers)),
-		storage:       cfg.Storage,
-		transport:     cfg.Transport,
-		rng:           rng,
-		term:          hs.Term,
-		vote:          hs.Vote,
-		log:           log,
+		id:        cfg.ID,
+		peers:     slices.Sorted(slices.Values(cfg.Peers)),
+		storage:   cfg.Storage,
+		transport: cfg.Transport,
+		rng:       rng,
+		term:      hs.Term,
+		vote:      hs.Vote,
+		log:       logSuffix{index: snap.Index, term: snap.Term, ents: ents},
+		snapshot:  snap,
+		// Everything in a snapshot was committed, so the commit index
+		// starts there rather than at 0.
+		commit:        snap.Index,
+		applied:       snap.Index,
 		state:         Follower,
 		electionTick:  cfg.ElectionTick,
 		heartbeatTick: cfg.HeartbeatTick,
 		maxMsgEntries: maxEntries,
 		maxMsgBytes:   maxBytes,
+	}
+	if snap.Index > 0 {
+		r.pendingSnap = &snap
 	}
 	r.resetElectionTimer()
 	return r, nil
@@ -197,6 +216,7 @@ func (r *Raft) Status() Status {
 		State:     r.state,
 		Commit:    r.commit,
 		LastIndex: r.lastIndex(),
+		Snapshot:  r.log.index,
 	}
 }
 
@@ -227,15 +247,58 @@ func (r *Raft) Propose(data []byte) (index, term uint64, err error) {
 
 // TakeCommitted returns the entries committed since the previous call, in
 // log order, and marks them applied. The caller must apply them in exactly
-// this order. After a restart, entries are returned again from index 1 as
-// the node relearns the commit index.
+// this order. After a restart, entries are returned again from just after
+// the snapshot, as the node relearns the commit index.
+//
+// If TakeSnapshot has a snapshot pending, it must be called first:
+// TakeCommitted panics rather than hand out entries that follow a snapshot
+// the application has not restored.
 func (r *Raft) TakeCommitted() []Entry {
+	if r.pendingSnap != nil {
+		panic("raft: TakeCommitted called with a snapshot pending; call TakeSnapshot first")
+	}
 	if r.commit <= r.applied {
 		return nil
 	}
-	ents := slices.Clone(r.log[r.applied:r.commit])
+	ents := r.log.slice(r.applied+1, r.commit+1)
 	r.applied = r.commit
 	return ents
+}
+
+// TakeSnapshot returns a snapshot the application must restore, replacing
+// its whole state, or nil if there is none. There is one after a restart
+// from a snapshot and after a follower installs one from the leader.
+// Entries from TakeCommitted then continue from just after it.
+func (r *Raft) TakeSnapshot() *Snapshot {
+	s := r.pendingSnap
+	r.pendingSnap = nil
+	return s
+}
+
+// Compact replaces the log up to and including index with a snapshot whose
+// data is the application's state after applying index (§7). index must
+// have been applied (returned by TakeCommitted), so the snapshot holds only
+// committed state, and must be past the current snapshot. Raft keeps its
+// own copy of data.
+//
+// Followers that still need entries before index are sent the snapshot
+// instead (InstallSnapshot).
+func (r *Raft) Compact(index uint64, data []byte) error {
+	if r.err != nil {
+		return r.err
+	}
+	if index <= r.log.index || index > r.applied {
+		return fmt.Errorf("raft: cannot compact through %d: snapshot is at %d and applied at %d", index, r.log.index, r.applied)
+	}
+	term, _ := r.termAt(index)
+	s := Snapshot{Index: index, Term: term, Data: bytes.Clone(data)}
+	if err := r.storage.SaveSnapshot(s); err != nil {
+		r.err = fmt.Errorf("raft: node %d stopped: saving snapshot at %d: %w", r.id, index, err)
+		return r.err
+	}
+	r.log.compact(index, term)
+	r.snapshot = s
+	return nil
 }
 
 // ReadIndex starts a linearizable read on the leader (§8). The outcome is
@@ -325,9 +388,10 @@ func (r *Raft) Step(m Message) error {
 	case m.Term > r.term:
 		// §5.1: a higher term in any message, request or response, means
 		// our term is stale. Adopt it and become a follower before acting
-		// on the message. A MsgApp in that term comes from its leader.
+		// on the message. A MsgApp or MsgSnap in that term comes from its
+		// leader.
 		lead := None
-		if m.Type == MsgApp {
+		if m.Type == MsgApp || m.Type == MsgSnap {
 			lead = m.From
 		}
 		if !r.becomeFollower(m.Term, lead) {
@@ -341,7 +405,7 @@ func (r *Raft) Step(m Message) error {
 		switch m.Type {
 		case MsgVote:
 			r.send(Message{Type: MsgVoteResp, To: m.From})
-		case MsgApp:
+		case MsgApp, MsgSnap:
 			r.send(Message{Type: MsgAppResp, To: m.From})
 		}
 		return nil
@@ -357,6 +421,8 @@ func (r *Raft) Step(m Message) error {
 		r.handleAppend(m)
 	case MsgAppResp:
 		r.handleAppendResp(m)
+	case MsgSnap:
+		r.handleSnapshot(m)
 	}
 	return r.err
 }
@@ -424,35 +490,55 @@ func (r *Raft) handleVoteResp(m Message) {
 	// timeouts start a new term.
 }
 
-// handleAppend is the receiver side of AppendEntries (Figure 2).
-func (r *Raft) handleAppend(m Message) {
+// followLeader records that m, a MsgApp or MsgSnap in the current term,
+// comes from this term's leader. Returns false if persisting failed.
+func (r *Raft) followLeader(m Message) bool {
 	switch r.state {
 	case Leader:
 		// Two leaders in one term would mean two majorities voted for
 		// different candidates, which the vote rules make impossible. If it
 		// happens, a safety invariant is already broken.
-		panic(fmt.Sprintf("raft: node %d is leader in term %d but received MsgApp from %d", r.id, r.term, m.From))
+		panic(fmt.Sprintf("raft: node %d is leader in term %d but received %v from %d", r.id, r.term, m.Type, m.From))
 	case Candidate:
 		// §5.2: another node won this term's election.
 		if !r.becomeFollower(r.term, m.From) {
-			return
+			return false
 		}
 	}
 	r.lead = m.From
 	r.resetElectionTimer()
+	return true
+}
+
+// handleAppend is the receiver side of AppendEntries (Figure 2).
+func (r *Raft) handleAppend(m Message) {
+	if !r.followLeader(m) {
+		return
+	}
+
+	// Entries up to our snapshot are committed, so by State Machine Safety
+	// they match the leader's; only what follows needs checking. A delayed
+	// request can start inside the snapshot.
+	prev, prevTerm, ents := m.PrevLogIndex, m.PrevLogTerm, m.Entries
+	if prev < r.log.index {
+		for len(ents) > 0 && ents[0].Index <= r.log.index {
+			ents = ents[1:]
+		}
+		prev, prevTerm = r.log.index, r.log.term
+	}
 
 	// Consistency check (§5.3): we must already have the entry just before
 	// the new ones, with the same term. Log Matching then guarantees that
 	// everything up to it matches the leader too.
-	if m.PrevLogIndex > r.lastIndex() {
+	if prev > r.lastIndex() {
 		r.send(Message{Type: MsgAppResp, To: m.From, RejectIndex: m.PrevLogIndex, HintIndex: r.lastIndex() + 1, Round: m.Round})
 		return
 	}
-	if t, _ := r.termAt(m.PrevLogIndex); t != m.PrevLogTerm {
+	if t, _ := r.termAt(prev); t != prevTerm {
 		// Suggest retrying from the first entry of the conflicting term, so
 		// the leader skips the whole term in one round trip (end of §5.3).
 		// Committed entries cannot conflict, so the hint stays above commit.
-		hint := m.PrevLogIndex
+		hint := prev
 		for hint > r.commit+1 {
 			if prev, _ := r.termAt(hint - 1); prev != t {
 				break
@@ -468,7 +554,6 @@ func (r *Raft) handleAppend(m Message) {
 	// step 3). Truncating at PrevLogIndex+1 unconditionally would be wrong:
 	// this message may be a delayed duplicate, and our log may already hold
 	// later entries from this leader that we have acknowledged.
-	ents := m.Entries
 	for len(ents) > 0 {
 		if t, ok := r.termAt(ents[0].Index); !ok || t != ents[0].Term {
 			break
@@ -482,12 +567,47 @@ func (r *Raft) handleAppend(m Message) {
 	// Only entries up to the last one in this message are known to match
 	// the leader. Entries after it, if any, may be stale, so the commit
 	// index must not pass it even if LeaderCommit is higher (Figure 2,
-	// receiver step 5).
-	lastNew := m.PrevLogIndex + uint64(len(m.Entries))
+	// receiver step 5). Our snapshot, being committed, matches too.
+	lastNew := max(m.PrevLogIndex+uint64(len(m.Entries)), r.log.index)
 	if c := min(m.LeaderCommit, lastNew); c > r.commit {
 		r.commit = c
 	}
 	r.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew, Round: m.Round})
+}
+
+// handleSnapshot is the receiver side of InstallSnapshot (Figure 13). The
+// whole snapshot arrives in one message, so there are no offsets or done
+// flag.
+func (r *Raft) handleSnapshot(m Message) {
+	if !r.followLeader(m) {
+		return
+	}
+	s := m.Snapshot
+	if s.Index == 0 || s.Term == 0 || s.Term > m.Term {
+		return // malformed
+	}
+	if s.Index <= r.commit {
+		// We already have everything it covers, committed. Installing it
+		// would move the state machine backward. This happens when a
+		// snapshot is delayed or duplicated.
+		r.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: s.Index, Round: m.Round})
+		return
+	}
+	// Persisted before anything changes in memory, and before replying:
+	// the leader counts our reply as replication of everything through
+	// s.Index.
+	if err := r.storage.SaveSnapshot(s); err != nil {
+		r.err = fmt.Errorf("raft: node %d stopped: saving snapshot at %d: %w", r.id, s.Index, err)
+		return
+	}
+	// Keep the entries after the snapshot only if our log holds its last
+	// entry: they may be entries we acknowledged, which the leader may have
+	// counted toward a commit. Otherwise none of our log can be trusted.
+	r.log.compact(s.Index, s.Term)
+	r.snapshot = s
+	r.pendingSnap = &s // a copy, so later snapshots do not change it
+	r.commit, r.applied = s.Index, s.Index
+	r.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: s.Index, Round: m.Round})
 }
 
 func (r *Raft) handleAppendResp(m Message) {
@@ -612,13 +732,18 @@ func (r *Raft) appendAsLeader(e Entry) bool {
 
 func (r *Raft) sendAppend(to uint64) {
 	prev := r.next[to] - 1
+	if prev < r.log.index {
+		r.sendSnapshot(to) // the entries it needs are gone
+		return
+	}
 	prevTerm, _ := r.termAt(prev)
 	end := min(r.lastIndex(), prev+uint64(r.maxMsgEntries))
 	size := 0
-	for i := prev; i < end; i++ {
-		size += len(r.log[i].Data)
-		if size > r.maxMsgBytes && i > prev {
-			end = i
+	for i := prev + 1; i <= end; i++ {
+		e, _ := r.log.entry(i)
+		size += len(e.Data)
+		if size > r.maxMsgBytes && i > prev+1 {
+			end = i - 1
 			break
 		}
 	}
@@ -630,10 +755,23 @@ func (r *Raft) sendAppend(to uint64) {
 		// A copy, so the message never aliases r.log, whose backing array
 		// is overwritten in place if this node later truncates as a
 		// follower.
-		Entries:      slices.Clone(r.log[prev:end]),
+		Entries:      r.log.slice(prev+1, end+1),
 		LeaderCommit: r.commit,
 		Round:        r.round,
 	})
+}
+
+// sendSnapshot sends the latest snapshot to a follower that needs entries
+// it replaced (§7).
+//
+// next moves past the snapshot at once, so the following heartbeats carry
+// the entries after it rather than the snapshot again. If the snapshot is
+// lost, the follower rejects those heartbeats, next falls back inside the
+// snapshot, and it is sent again. Over a transport that keeps order, as TCP
+// does, the snapshot arrives before the entries that follow it.
+func (r *Raft) sendSnapshot(to uint64) {
+	r.send(Message{Type: MsgSnap, To: to, Snapshot: r.snapshot, Round: r.round})
+	r.next[to] = r.snapshot.Index + 1
 }
 
 func (r *Raft) broadcastAppend() {

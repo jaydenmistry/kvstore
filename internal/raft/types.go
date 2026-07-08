@@ -54,8 +54,12 @@ const (
 	// MsgApp is an AppendEntries request (§5.3). With no entries it is a
 	// heartbeat.
 	MsgApp
-	// MsgAppResp is the response to MsgApp.
+	// MsgAppResp is the response to MsgApp, and to MsgSnap.
 	MsgAppResp
+	// MsgSnap is an InstallSnapshot request (§7), sent instead of MsgApp
+	// when a follower needs entries the leader has compacted. Its response
+	// is a MsgAppResp whose MatchIndex is the snapshot's index.
+	MsgSnap
 )
 
 func (t MessageType) String() string {
@@ -68,6 +72,8 @@ func (t MessageType) String() string {
 		return "MsgApp"
 	case MsgAppResp:
 		return "MsgAppResp"
+	case MsgSnap:
+		return "MsgSnap"
 	}
 	return "MsgUnknown"
 }
@@ -113,7 +119,10 @@ type Message struct {
 	RejectIndex uint64
 	HintIndex   uint64
 
-	// MsgApp: the leader's heartbeat round, echoed in the MsgAppResp. A
+	// MsgSnap: the leader's latest snapshot.
+	Snapshot Snapshot
+
+	// MsgApp and MsgSnap: the leader's heartbeat round, echoed in the MsgAppResp. A
 	// response with round r proves the follower still accepted this leader
 	// when it received a request sent at round r, which is how ReadIndex
 	// confirms leadership.
@@ -149,4 +158,5 @@ type Status struct {
 	State     State
 	Commit    uint64 // highest index known to be committed
 	LastIndex uint64 // index of the last entry in the log
+	Snapshot  uint64 // last index covered by the latest snapshot
 }

@@ -44,8 +44,8 @@ func app(from, to, term, prevIndex, prevTerm, commit uint64, entries []Entry) Me
 
 func checkLog(t *testing.T, r *Raft, want []Entry) {
 	t.Helper()
-	if !equalEntries(r.log, want) {
-		t.Fatalf("log %+v, want %+v", r.log, want)
+	if !equalEntries(r.log.ents, want) {
+		t.Fatalf("log %+v, want %+v", r.log.ents, want)
 	}
 }
 

@@ -27,7 +27,7 @@ func TestDiskStorageRoundTrip(t *testing.T) {
 				dir = t.TempDir()
 			}
 			s := mustOpenDisk(t, fsys, dir)
-			if hs, _, _ := s.Load(); hs != (HardState{}) {
+			if hs, _, _, _ := s.Load(); hs != (HardState{}) {
 				t.Fatalf("new storage has state %+v", hs)
 			}
 			for _, hs := range []HardState{{Term: 1, Vote: 1}, {Term: 2}, {Term: 2, Vote: 3}} {
@@ -38,7 +38,7 @@ func TestDiskStorageRoundTrip(t *testing.T) {
 			s.Close()
 			s = mustOpenDisk(t, fsys, dir)
 			defer s.Close()
-			if hs, _, _ := s.Load(); hs != (HardState{Term: 2, Vote: 3}) {
+			if hs, _, _, _ := s.Load(); hs != (HardState{Term: 2, Vote: 3}) {
 				t.Fatalf("after reopen: %+v, want {2 3}", hs)
 			}
 		})
@@ -59,7 +59,7 @@ func TestDiskStorageSurvivesCrash(t *testing.T) {
 		}
 		m.Crash(rand.New(rand.NewPCG(seed, 0)))
 		s = mustOpenDisk(t, m, "/data")
-		if hs, _, _ := s.Load(); hs != (HardState{Term: 5, Vote: 2}) {
+		if hs, _, _, _ := s.Load(); hs != (HardState{Term: 5, Vote: 2}) {
 			t.Fatalf("seed %d: after crash: %+v, want {5 2}", seed, hs)
 		}
 	}
@@ -80,7 +80,7 @@ func TestDiskStorageFailedSaveKeepsOldState(t *testing.T) {
 	if err := s.Save(&HardState{Term: 2, Vote: 2}, nil); err == nil {
 		t.Fatal("Save succeeded despite fsync failure")
 	}
-	if hs, _, _ := s.Load(); hs != (HardState{Term: 1, Vote: 1}) {
+	if hs, _, _, _ := s.Load(); hs != (HardState{Term: 1, Vote: 1}) {
 		t.Fatalf("in-memory state changed after failed save: %+v", hs)
 	}
 }

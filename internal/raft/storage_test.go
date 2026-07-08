@@ -49,7 +49,7 @@ func storageImpls(t *testing.T, fn func(t *testing.T, s Storage, reopen func() S
 
 func checkLoad(t *testing.T, s Storage, wantHS HardState, want []Entry) {
 	t.Helper()
-	hs, log, err := s.Load()
+	hs, _, log, err := s.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestStorageLoadReturnsCopy(t *testing.T) {
 		if err := s.Save(nil, ents(1, 1, 2, 1)); err != nil {
 			t.Fatal(err)
 		}
-		_, log, _ := s.Load()
+		_, _, log, _ := s.Load()
 		log[0].Term = 99
 		if err := s.Save(nil, ents(3, 1)); err != nil {
 			t.Fatal(err)
@@ -143,7 +143,7 @@ func TestDiskStorageSaveIsAtomicAcrossCrashes(t *testing.T) {
 		m.SetFault(nil)
 		m.Crash(rand.New(rand.NewPCG(seed, 0)))
 
-		gotHS, log, _ := mustOpenDisk(t, m, "/data").Load()
+		gotHS, _, log, _ := mustOpenDisk(t, m, "/data").Load()
 		switch {
 		case gotHS == (HardState{Term: 1}) && equalEntries(log, before):
 		case gotHS == hs && equalEntries(log, append(slices.Clone(before), batch...)):

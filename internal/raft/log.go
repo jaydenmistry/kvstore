@@ -2,28 +2,21 @@ package raft
 
 import "fmt"
 
-// The log is held in memory in r.log, where r.log[i] has index i+1. Index 0
-// is the empty position before the first entry and has term 0, which makes
-// the consistency check for the first entry (PrevLogIndex 0) always pass.
+// The log is held in memory in r.log, a logSuffix (see storage.go): the
+// entries after the latest snapshot, plus the index and term of the last
+// entry the snapshot covers.
 
-func (r *Raft) lastIndex() uint64 { return uint64(len(r.log)) }
+func (r *Raft) lastIndex() uint64 { return r.log.lastIndex() }
 
 func (r *Raft) lastTerm() uint64 {
-	t, _ := r.termAt(r.lastIndex())
+	t, _ := r.log.termAt(r.lastIndex())
 	return t
 }
 
-// termAt returns the term of the entry at index i. Index 0 has term 0. ok is
-// false if the log does not extend to i.
-func (r *Raft) termAt(i uint64) (term uint64, ok bool) {
-	switch {
-	case i == 0:
-		return 0, true
-	case i > r.lastIndex():
-		return 0, false
-	}
-	return r.log[i-1].Term, true
-}
+// termAt returns the term of the entry at index i. ok is false if the log
+// does not extend to i, or if i is covered by the snapshot and its term is
+// no longer known. The snapshot's own last index still has a term.
+func (r *Raft) termAt(i uint64) (term uint64, ok bool) { return r.log.termAt(i) }
 
 // saveEntries durably writes entries over the log starting at
 // entries[0].Index, discarding whatever was there and after it, then makes
@@ -44,15 +37,10 @@ func (r *Raft) saveEntries(entries []Entry) bool {
 		r.err = fmt.Errorf("raft: node %d stopped: saving entries from index %d: %w", r.id, entries[0].Index, err)
 		return false
 	}
-	r.log = append(r.log[:entries[0].Index-1], entries...)
+	r.log.splice(entries)
 	return true
 }
 
-// Entry returns the entry at index i, if the log has one. It is meant for
-// tests and debugging.
-func (r *Raft) Entry(i uint64) (Entry, bool) {
-	if i == 0 || i > r.lastIndex() {
-		return Entry{}, false
-	}
-	return r.log[i-1], true
-}
+// Entry returns the entry at index i, if the log has one and it has not
+// been compacted into a snapshot. It is meant for tests and debugging.
+func (r *Raft) Entry(i uint64) (Entry, bool) { return r.log.entry(i) }

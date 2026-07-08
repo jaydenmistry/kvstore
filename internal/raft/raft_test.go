@@ -41,6 +41,14 @@ func (s *testStorage) Save(hs *HardState, entries []Entry) error {
 	return s.MemoryStorage.Save(hs, entries)
 }
 
+func (s *testStorage) SaveSnapshot(snap Snapshot) error {
+	if s.fail != nil {
+		return s.fail
+	}
+	s.ev.log = append(s.ev.log, fmt.Sprintf("save snapshot %d@%d", snap.Index, snap.Term))
+	return s.MemoryStorage.SaveSnapshot(snap)
+}
+
 const (
 	testElection  = 10
 	testHeartbeat = 1
