@@ -79,6 +79,34 @@ func TestLaggingFollowerCatchesUp(t *testing.T) {
 	}
 }
 
+func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
+	// While a follower is cut off, the others compact their logs past what
+	// it has. It can only catch up by installing a snapshot.
+	for seed := range uint64(20) {
+		c := newCluster(t, 5, seed)
+		c.compactEvery = 20
+		lead := c.waitForLeader(20 * electionTick)
+		lag := others(c.ids, lead)[0]
+		c.net.Partition([]uint64{lag}, others(c.ids, lag))
+		for i := range 200 {
+			c.propose(fmt.Sprintf("cmd-%d", i))
+			if i%10 == 0 {
+				c.tick()
+			}
+		}
+		c.run(5)
+		if s := c.nodes[lead].Status(); s.Snapshot <= c.nodes[lag].Status().LastIndex {
+			c.fatalf("leader's snapshot at %d does not pass the follower's last index %d", s.Snapshot, c.nodes[lag].Status().LastIndex)
+		}
+		c.net.Heal()
+		c.waitConverged(50 * electionTick)
+		c.checkAllApplied()
+		if c.installed == 0 {
+			c.fatalf("the follower caught up without installing a snapshot")
+		}
+	}
+}
+
 func TestDeposedLeaderEntriesAreReplaced(t *testing.T) {
 	// Figure 7 in miniature. The leader is cut off and keeps accepting
 	// proposals it can never commit. The majority elects a new leader and
@@ -157,7 +185,7 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 	// repaired, every node must converge on the same applied log, which
 	// must contain every entry that ever committed.
 	const seeds = 200
-	var proposed, committed int
+	var proposed, committed, installed int
 	for seed := range uint64(seeds) {
 		var c *cluster
 		if seed%2 == 0 {
@@ -165,6 +193,8 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 		} else {
 			c = newDiskCluster(t, 5, seed)
 		}
+		// A third of the runs never compact, a third compact often.
+		c.compactEvery = []int{0, 7, 30}[seed%3]
 		rng := rand.New(rand.NewPCG(seed, 3))
 		c.net.SetDropRate(0.1)
 		c.net.SetDuplicateRate(0.05)
@@ -223,8 +253,9 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 			c.fatalf("final proposal not applied last")
 		}
 		committed += len(c.committed)
+		installed += c.installed
 	}
-	t.Logf("%d proposals accepted by a leader, %d entries committed, across %d runs", proposed, committed, seeds)
+	t.Logf("%d proposals accepted by a leader, %d entries committed, %d snapshots installed, across %d runs", proposed, committed, installed, seeds)
 	if committed < seeds*50 {
 		t.Fatalf("only %d entries committed across %d runs; chaos too severe to test much", committed, seeds)
 	}
@@ -235,6 +266,9 @@ func TestDiskClusterSurvivesFullPowerLoss(t *testing.T) {
 	// survive because each was fsynced on a majority before it committed.
 	for seed := range uint64(30) {
 		c := newDiskCluster(t, 3, seed)
+		if seed%2 == 1 {
+			c.compactEvery = 5
+		}
 		for round := range 5 {
 			c.waitForLeader(30 * electionTick)
 			for i := range 10 {

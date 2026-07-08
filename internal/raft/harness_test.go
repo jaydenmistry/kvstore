@@ -2,6 +2,7 @@ package raft_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -31,6 +32,11 @@ const (
 // plus that terms never decrease and votes never change within a term, even
 // across restarts. Log Matching is checked across all pairs of nodes every
 // few ticks, because it is quadratic.
+//
+// Each node's state machine is the list of entries it has applied. With
+// compactEvery set, nodes snapshot that list and compact their logs as they
+// go, and a snapshot a node restores must hold exactly the committed
+// entries.
 type cluster struct {
 	t     *testing.T
 	seed  uint64
@@ -53,8 +59,16 @@ type cluster struct {
 
 	// Per node, reset when the node restarts.
 	seenCommit    map[uint64]uint64       // commit index already recorded
-	applied       map[uint64][]raft.Entry // entries returned by TakeCommitted
+	applied       map[uint64][]raft.Entry // the node's state machine
 	checkedLeader map[uint64]uint64       // term whose Leader Completeness was checked
+
+	// compactEvery, if positive, makes each node compact its log whenever
+	// it has applied that many entries past its snapshot.
+	compactEvery int
+	restoring    bool // set while start runs check on a new node
+	// installed counts snapshots restored by running nodes, which come
+	// from InstallSnapshot (not from a restart).
+	installed int
 }
 
 func newCluster(t *testing.T, n int, seed uint64) *cluster {
@@ -132,11 +146,13 @@ func (c *cluster) start(id uint64) {
 		c.fatalf("starting node %d: %v", id, err)
 	}
 	c.nodes[id] = r
-	c.seenCommit[id] = 0
+	c.seenCommit[id] = r.Status().Snapshot
 	c.applied[id] = nil
 	delete(c.checkedLeader, id)
 	c.net.SetDown(id, false)
+	c.restoring = true
 	c.check(id)
+	c.restoring = false
 }
 
 // crash stops a node, losing its in-memory state. With MemoryStorage,
@@ -232,6 +248,9 @@ func (c *cluster) check(id uint64) {
 	}
 	for i := c.seenCommit[id] + 1; i <= s.Commit; i++ {
 		e, ok := r.Entry(i)
+		if !ok && i <= s.Snapshot {
+			continue // installed from a snapshot; checked when it is restored
+		}
 		if !ok {
 			c.fatalf("node %d commit %d is past its last index %d", id, s.Commit, s.LastIndex)
 		}
@@ -247,9 +266,34 @@ func (c *cluster) check(id uint64) {
 	if s.State == raft.Leader && c.checkedLeader[id] != s.Term {
 		c.checkedLeader[id] = s.Term
 		for i, want := range c.committed {
+			if i <= s.Snapshot {
+				continue // in its snapshot, which was checked when taken
+			}
 			if got, ok := r.Entry(i); !ok || !sameEntry(got, want) {
 				c.fatalf("node %d became leader of term %d without committed entry %+v (has %+v)", id, s.Term, want, got)
 			}
+		}
+	}
+
+	// A snapshot to restore replaces the state machine. It must hold
+	// exactly the committed entries up to its index.
+	if snap := r.TakeSnapshot(); snap != nil {
+		ents := decodeApplied(snap.Data)
+		if uint64(len(ents)) != snap.Index {
+			c.fatalf("node %d restored a snapshot at %d holding %d entries", id, snap.Index, len(ents))
+		}
+		for _, e := range ents {
+			if want, ok := c.committed[e.Index]; ok && !sameEntry(e, want) {
+				c.fatalf("node %d restored %+v from a snapshot, but %+v is committed there", id, e, want)
+			}
+			c.committed[e.Index] = e
+		}
+		if last := ents[len(ents)-1]; last.Term != snap.Term {
+			c.fatalf("node %d snapshot at %d claims term %d, but its last entry has term %d", id, snap.Index, snap.Term, last.Term)
+		}
+		c.applied[id] = ents
+		if !c.restoring {
+			c.installed++
 		}
 	}
 
@@ -264,6 +308,40 @@ func (c *cluster) check(id uint64) {
 		}
 		c.applied[id] = append(c.applied[id], e)
 	}
+
+	if c.compactEvery > 0 {
+		if n := uint64(len(c.applied[id])); n >= s.Snapshot+uint64(c.compactEvery) {
+			if err := r.Compact(n, encodeApplied(c.applied[id])); err != nil {
+				c.fatalf("node %d Compact(%d): %v", id, n, err)
+			}
+		}
+	}
+}
+
+// encodeApplied serializes a state machine for a snapshot.
+func encodeApplied(ents []raft.Entry) []byte {
+	var b []byte
+	for _, e := range ents {
+		b = binary.LittleEndian.AppendUint64(b, e.Index)
+		b = binary.LittleEndian.AppendUint64(b, e.Term)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(e.Data)))
+		b = append(b, e.Data...)
+	}
+	return b
+}
+
+func decodeApplied(b []byte) []raft.Entry {
+	var ents []raft.Entry
+	for len(b) > 0 {
+		e := raft.Entry{Index: binary.LittleEndian.Uint64(b), Term: binary.LittleEndian.Uint64(b[8:])}
+		n := binary.LittleEndian.Uint32(b[16:])
+		if n > 0 {
+			e.Data = b[20 : 20+n]
+		}
+		ents = append(ents, e)
+		b = b[20+n:]
+	}
+	return ents
 }
 
 // checkLogMatching verifies Log Matching (§5.3) for every pair of live
@@ -279,7 +357,7 @@ func (c *cluster) checkLogMatching() {
 			}
 			n := min(ra.Status().LastIndex, rb.Status().LastIndex)
 			diverged := false
-			for idx := uint64(1); idx <= n; idx++ {
+			for idx := max(ra.Status().Snapshot, rb.Status().Snapshot) + 1; idx <= n; idx++ {
 				ea, _ := ra.Entry(idx)
 				eb, _ := rb.Entry(idx)
 				if ea.Term != eb.Term {
