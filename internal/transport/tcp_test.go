@@ -64,6 +64,20 @@ func TestTCPDeliversMessages(t *testing.T) {
 	}
 }
 
+func TestTCPDeliversSnapshot(t *testing.T) {
+	a, b := pair(t)
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	want := raft.Message{Type: raft.MsgSnap, From: 1, To: 2, Term: 4, Round: 2,
+		Snapshot: raft.Snapshot{Index: 900, Term: 3, Data: data}}
+	a.Send(want)
+	if got := receive(t, b); !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot message changed in transit: index %d term %d, %d bytes", got.Snapshot.Index, got.Snapshot.Term, len(got.Snapshot.Data))
+	}
+}
+
 func TestTCPPreservesOrderOnOneConnection(t *testing.T) {
 	a, b := pair(t)
 	for i := range uint64(100) {

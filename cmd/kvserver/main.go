@@ -47,6 +47,7 @@ func run() int {
 	flag.Var(peers, "peer", "cluster member as `ID=RAFT_ADDR,API_ADDR`; repeat for every member, including this node")
 	dataDir := flag.String("data", "", "data `directory`")
 	tick := flag.Duration("tick", server.DefaultTickInterval, "Raft tick `interval`")
+	snapEvery := flag.Int("snapshot-every", server.DefaultSnapshotEvery, "compact the log after this many applied `entries`; negative disables")
 	flag.Parse()
 	if flag.NArg() > 0 || *id == 0 || *dataDir == "" || len(peers) == 0 {
 		fmt.Fprintln(os.Stderr, "kvserver: -id, -data, and -peer are required")
@@ -75,11 +76,12 @@ func run() int {
 		return exitError
 	}
 	s, err := server.New(server.Config{
-		ID:           *id,
-		Peers:        peers,
-		DataDir:      *dataDir,
-		TickInterval: *tick,
-		Logger:       log,
+		ID:            *id,
+		Peers:         peers,
+		DataDir:       *dataDir,
+		TickInterval:  *tick,
+		SnapshotEvery: *snapEvery,
+		Logger:        log,
 	}, raftLn, apiLn)
 	if err != nil {
 		return failed(log, err)

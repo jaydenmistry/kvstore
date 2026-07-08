@@ -45,6 +45,9 @@ type Config struct {
 	HeartbeatTick int
 	// RequestTimeout bounds how long a request waits inside the node.
 	RequestTimeout time.Duration
+	// SnapshotEvery is how many applied entries trigger a snapshot and log
+	// compaction. Zero means DefaultSnapshotEvery; negative disables it.
+	SnapshotEvery int
 
 	Logger *slog.Logger
 }
@@ -56,6 +59,7 @@ const (
 	DefaultElectionTick   = 10
 	DefaultHeartbeatTick  = 2
 	DefaultRequestTimeout = 3 * time.Second
+	DefaultSnapshotEvery  = 10000
 )
 
 // ErrFatal wraps errors that stop the node: storage failed, or a committed
@@ -95,6 +99,9 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 	}
 	if cfg.RequestTimeout == 0 {
 		cfg.RequestTimeout = DefaultRequestTimeout
+	}
+	if cfg.SnapshotEvery == 0 {
+		cfg.SnapshotEvery = DefaultSnapshotEvery
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -137,7 +144,7 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		log:     log,
 		storage: storage,
 		tr:      tr,
-		replica: kv.NewReplica(r, timeoutTicks),
+		replica: kv.NewReplica(r, kv.Config{RequestTimeout: timeoutTicks, SnapshotEvery: uint64(max(0, cfg.SnapshotEvery))}),
 		apiLn:   apiLn,
 		ops:     make(chan func() error),
 		stopped: make(chan struct{}),
@@ -245,6 +252,7 @@ type Status struct {
 	Commit    uint64 `json:"commit"`
 	Applied   uint64 `json:"applied"`
 	LastIndex uint64 `json:"last_index"`
+	Snapshot  uint64 `json:"snapshot"`
 }
 
 func (s *Server) status(ctx context.Context) (Status, error) {
@@ -253,7 +261,7 @@ func (s *Server) status(ctx context.Context) (Status, error) {
 		rs := s.replica.Raft().Status()
 		st = Status{
 			ID: rs.ID, State: rs.State.String(), Term: rs.Term, Leader: rs.Lead,
-			Commit: rs.Commit, Applied: s.replica.Applied(), LastIndex: rs.LastIndex,
+			Commit: rs.Commit, Applied: s.replica.Applied(), LastIndex: rs.LastIndex, Snapshot: rs.Snapshot,
 		}
 	})
 	return st, err

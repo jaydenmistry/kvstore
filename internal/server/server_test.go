@@ -59,6 +59,9 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 		cfg := Config{
 			ID: id, Peers: peers, DataDir: t.TempDir(),
 			TickInterval: 10 * time.Millisecond, ElectionTick: 10, HeartbeatTick: 2,
+			// Compact often, so a restarted node catches up through
+			// InstallSnapshot over TCP.
+			SnapshotEvery:  5,
 			RequestTimeout: time.Second, Logger: quiet,
 		}
 		c.nodes[id] = &node{cfg: cfg}
@@ -247,6 +250,9 @@ func TestSurvivesLeaderLossAndRestartCatchesUp(t *testing.T) {
 	want, err := c.status(lead)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want.Snapshot <= 20 {
+		t.Fatalf("leader's snapshot is at %d; the restarted node would not need it", want.Snapshot)
 	}
 	eventually(t, "the restarted node catches up", func() bool {
 		st, err := c.status(old)
