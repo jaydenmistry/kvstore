@@ -162,6 +162,60 @@ func TestRetryAfterLeaderCrashAppliesOnce(t *testing.T) {
 	}
 }
 
+func TestDuplicateDetectionSurvivesSnapshotRestore(t *testing.T) {
+	// Every node compacts past client 7's Delete, then the whole cluster
+	// restarts and rebuilds its state from those snapshots. A retry of the
+	// Delete must still be recognized as a duplicate.
+	for _, disk := range []bool{false, true} {
+		c := newCluster(t, 3, 1, disk)
+		c.setSnapshotEvery(3)
+		l := c.leader()
+		c.do(l, putReq(7, 1, "k", "v"))
+		c.do(l, deleteReq(7, 2, "k"))
+		for i := range 6 {
+			c.do(l, putReq(8, uint64(i+1), "other", fmt.Sprint(i)))
+		}
+		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
+		for _, id := range c.ids {
+			c.crash(id)
+		}
+		for _, id := range c.ids {
+			c.start(id)
+			if s := c.nodes[id].raft.Status().Snapshot; s < 4 {
+				t.Fatalf("disk=%v: node %d restarted with its snapshot at %d, before the Delete", disk, id, s)
+			}
+		}
+		l = c.leader()
+		if res := c.do(l, deleteReq(7, 2, "k")); !res.Found {
+			t.Fatalf("disk=%v: retried delete after restore reported not found", disk)
+		}
+		if res := c.wait(c.submit(l, putReq(7, 1, "k", "v")), 2*requestTimeout); !errors.Is(res.Err, ErrStaleSequence) {
+			t.Fatalf("disk=%v: old write after restore: %+v, want ErrStaleSequence", disk, res)
+		}
+		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
+		c.checkReplicasAgree()
+	}
+}
+
+func TestFollowerCatchesUpBySnapshot(t *testing.T) {
+	for seed := range uint64(10) {
+		c := newCluster(t, 3, seed, seed%2 == 1)
+		c.setSnapshotEvery(5)
+		l := c.leader()
+		f := others(c.ids, l)[0]
+		c.net.Partition([]uint64{f}, others(c.ids, f))
+		for i := range 30 {
+			c.do(l, putReq(1, uint64(i+1), fmt.Sprint("k", i%4), fmt.Sprint(i)))
+		}
+		if s, last := c.nodes[l].raft.Status().Snapshot, c.nodes[f].raft.Status().LastIndex; s <= last {
+			c.fatalf("leader's snapshot at %d does not pass the follower's last index %d", s, last)
+		}
+		c.net.Heal()
+		c.waitApplied(c.nodes[l].sm.Applied(), 20*electionTick)
+		c.checkReplicasAgree()
+	}
+}
+
 func TestReadsAreBatched(t *testing.T) {
 	c := newCluster(t, 3, 1, false)
 	l := c.leader()

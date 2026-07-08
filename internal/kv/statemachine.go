@@ -1,8 +1,11 @@
 package kv
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/jaydenmistry/kvstore/internal/raft"
 )
@@ -105,4 +108,114 @@ func (s *StateMachine) Apply(e raft.Entry) (Result, error) {
 	}
 	s.sessions[c.ClientID] = session{seq: c.Seq, result: res}
 	return res, nil
+}
+
+// Snapshot encoding, with integers big-endian and keys and clients in
+// sorted order, so equal states encode to equal bytes:
+//
+//	| version u8 = 1 |
+//	| key count u64 | (key length u32 | key | value length u32 | value)... |
+//	| session count u64 | (client u64 | seq u64 | found u8)... |
+//
+// The sessions are part of the replicated state. A node restored without
+// them would apply a retried write a second time.
+const snapshotVersion = 1
+
+// Snapshot serializes the state machine: the data and the client sessions.
+// It describes the state after Applied.
+func (s *StateMachine) Snapshot() []byte {
+	b := []byte{snapshotVersion}
+	b = binary.BigEndian.AppendUint64(b, uint64(len(s.data)))
+	for _, k := range slices.Sorted(maps.Keys(s.data)) {
+		v := s.data[k]
+		b = binary.BigEndian.AppendUint32(b, uint32(len(k)))
+		b = append(b, k...)
+		b = binary.BigEndian.AppendUint32(b, uint32(len(v)))
+		b = append(b, v...)
+	}
+	b = binary.BigEndian.AppendUint64(b, uint64(len(s.sessions)))
+	for _, c := range slices.Sorted(maps.Keys(s.sessions)) {
+		sess := s.sessions[c]
+		b = binary.BigEndian.AppendUint64(b, c)
+		b = binary.BigEndian.AppendUint64(b, sess.seq)
+		found := byte(0)
+		if sess.result.Found {
+			found = 1
+		}
+		b = append(b, found)
+	}
+	return b
+}
+
+// Restore replaces the state machine's state with a snapshot's. Like Apply,
+// an error is fatal: the snapshot is committed state that every replica
+// shares.
+func (s *StateMachine) Restore(snap raft.Snapshot) error {
+	d := decoder{b: snap.Data}
+	if v := d.byte(); v != snapshotVersion {
+		return fmt.Errorf("kv: snapshot at %d has version %d", snap.Index, v)
+	}
+	data := map[string][]byte{}
+	for n := d.uint64(); n > 0 && d.err == nil; n-- {
+		k := string(d.bytes(d.uint32()))
+		v := d.bytes(d.uint32())
+		if len(v) == 0 {
+			v = nil
+		}
+		data[k] = v
+	}
+	sessions := map[uint64]session{}
+	for n := d.uint64(); n > 0 && d.err == nil; n-- {
+		c, seq := d.uint64(), d.uint64()
+		sessions[c] = session{seq: seq, result: Result{Found: d.byte() == 1}}
+	}
+	if d.err == nil && len(d.b) > 0 {
+		d.err = fmt.Errorf("%d bytes left over", len(d.b))
+	}
+	if d.err != nil {
+		return fmt.Errorf("kv: snapshot at %d is malformed: %w", snap.Index, d.err)
+	}
+	s.data, s.sessions, s.applied = data, sessions, snap.Index
+	return nil
+}
+
+// decoder reads a snapshot, recording the first error and returning zero
+// values after it.
+type decoder struct {
+	b   []byte
+	err error
+}
+
+func (d *decoder) bytes(n uint64) []byte {
+	if d.err != nil {
+		return nil
+	}
+	if n > uint64(len(d.b)) {
+		d.err = errors.New("truncated")
+		return nil
+	}
+	out := d.b[:n:n]
+	d.b = d.b[n:]
+	return out
+}
+
+func (d *decoder) byte() byte {
+	if b := d.bytes(1); b != nil {
+		return b[0]
+	}
+	return 0
+}
+
+func (d *decoder) uint32() uint64 {
+	if b := d.bytes(4); b != nil {
+		return uint64(binary.BigEndian.Uint32(b))
+	}
+	return 0
+}
+
+func (d *decoder) uint64() uint64 {
+	if b := d.bytes(8); b != nil {
+		return binary.BigEndian.Uint64(b)
+	}
+	return 0
 }

@@ -34,6 +34,19 @@ type cluster struct {
 	// disks is set for disk-backed clusters, where a crash is a power loss
 	// (see the raft package's harness).
 	disks map[uint64]*vfs.Mem
+	// snapshotEvery is passed to every Replica; see setSnapshotEvery.
+	snapshotEvery uint64
+}
+
+// setSnapshotEvery sets how often every node, running or restarted later,
+// compacts its log.
+func (c *cluster) setSnapshotEvery(n uint64) {
+	c.snapshotEvery = n
+	for _, p := range c.nodes {
+		if p != nil {
+			p.snapshotEvery = n
+		}
+	}
 }
 
 func newCluster(t *testing.T, n int, seed uint64, disk bool) *cluster {
@@ -93,7 +106,7 @@ func (c *cluster) start(id uint64) {
 	if err != nil {
 		c.fatalf("starting node %d: %v", id, err)
 	}
-	c.nodes[id] = NewReplica(r, requestTimeout)
+	c.nodes[id] = NewReplica(r, Config{RequestTimeout: requestTimeout, SnapshotEvery: c.snapshotEvery})
 	c.net.SetDown(id, false)
 }
 

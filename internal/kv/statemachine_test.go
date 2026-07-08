@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -125,4 +126,98 @@ func TestApplyRejectsMalformedEntry(t *testing.T) {
 	if sm.Applied() != 0 {
 		t.Fatal("malformed entry counted as applied")
 	}
+}
+
+func restored(t *testing.T, sm *StateMachine) *StateMachine {
+	t.Helper()
+	out := NewStateMachine()
+	if err := out.Restore(raft.Snapshot{Index: sm.Applied(), Term: 1, Data: sm.Snapshot()}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestSnapshotRoundTrip(t *testing.T) {
+	a := newApplier(t)
+	a.apply(put(1, 1, "k", "v"))
+	a.apply(put(1, 2, "empty", ""))
+	a.apply(put(2, 1, string([]byte{0, 0xff, '/'}), "binary"))
+	a.apply(put(2, 2, "gone", "x"))
+	a.apply(del(2, 3, "gone"))
+	b := &applier{t, restored(t, a.sm)}
+	if b.sm.Applied() != a.sm.Applied() {
+		t.Fatalf("restored applied %d, want %d", b.sm.Applied(), a.sm.Applied())
+	}
+	b.want("k", "v", true)
+	b.want("empty", "", true)
+	b.want(string([]byte{0, 0xff, '/'}), "binary", true)
+	b.want("gone", "", false)
+	// Applying continues from the snapshot's index.
+	b.apply(put(1, 3, "k", "w"))
+	b.want("k", "w", true)
+}
+
+func TestRestoredStateMachineStillDetectsDuplicates(t *testing.T) {
+	// The sessions are in the snapshot: a retried Delete restored from it
+	// returns the original result, and an old write stays stale.
+	a := newApplier(t)
+	a.apply(put(1, 1, "k", "v"))
+	a.apply(del(1, 2, "k"))
+	b := &applier{t, restored(t, a.sm)}
+	if res := b.apply(del(1, 2, "k")); !res.Found || res.Err != nil {
+		t.Fatalf("retried delete after restore: %+v, want the original result (found)", res)
+	}
+	if res := b.apply(put(1, 1, "k", "v")); !errors.Is(res.Err, ErrStaleSequence) {
+		t.Fatalf("old write after restore: %+v, want ErrStaleSequence", res)
+	}
+	b.want("k", "", false)
+}
+
+func TestSnapshotIsDeterministic(t *testing.T) {
+	// Map iteration order is random in Go; the encoding must not be.
+	a := newApplier(t)
+	for i := range uint64(50) {
+		a.apply(put(i%7+1, i/7+1, string(rune('a'+i%26)), "v"))
+	}
+	first := a.sm.Snapshot()
+	for range 10 {
+		if !bytes.Equal(a.sm.Snapshot(), first) {
+			t.Fatal("snapshot bytes differ between calls")
+		}
+	}
+	if !bytes.Equal(restored(t, a.sm).Snapshot(), first) {
+		t.Fatal("restored state machine snapshots differently")
+	}
+}
+
+func TestRestoreRejectsMalformedSnapshot(t *testing.T) {
+	a := newApplier(t)
+	a.apply(put(1, 1, "key", "value"))
+	good := a.sm.Snapshot()
+	for name, data := range map[string][]byte{
+		"empty":     nil,
+		"version":   append([]byte{9}, good[1:]...),
+		"truncated": good[:len(good)-1],
+		"trailing":  append(bytes.Clone(good), 0),
+	} {
+		sm := NewStateMachine()
+		if err := sm.Restore(raft.Snapshot{Index: 1, Term: 1, Data: data}); err == nil {
+			t.Errorf("%s: restored", name)
+		}
+		if sm.Applied() != 0 {
+			t.Errorf("%s: a failed restore changed the state", name)
+		}
+	}
+}
+
+func FuzzRestore(f *testing.F) {
+	sm := NewStateMachine()
+	c := put(1, 1, "k", "v")
+	if _, err := sm.Apply(raft.Entry{Index: 1, Term: 1, Data: c.Encode()}); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(sm.Snapshot())
+	f.Fuzz(func(t *testing.T, b []byte) {
+		NewStateMachine().Restore(raft.Snapshot{Index: 1, Term: 1, Data: b}) // must not panic
+	})
 }

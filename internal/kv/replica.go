@@ -43,10 +43,11 @@ type Request struct {
 // share the next round, so the cost of confirming leadership is paid once
 // per batch rather than once per read.
 type Replica struct {
-	raft    *raft.Raft
-	sm      *StateMachine
-	timeout int // ticks
-	now     int // ticks since creation
+	raft          *raft.Raft
+	sm            *StateMachine
+	timeout       int // ticks
+	snapshotEvery uint64
+	now           int // ticks since creation
 
 	// term is the term in which this node accepted the pending requests as
 	// leader, or 0 if it is not leader.
@@ -74,15 +75,25 @@ type pendingRead struct {
 func (w pendingWrite) expiry() (int, func(Result)) { return w.deadline, w.done }
 func (r pendingRead) expiry() (int, func(Result))  { return r.deadline, r.done }
 
+// Config configures a Replica.
+type Config struct {
+	// RequestTimeout is how many ticks a request may wait before it fails
+	// with ErrTimeout. It must be positive.
+	RequestTimeout int
+	// SnapshotEvery, if positive, makes the Replica snapshot the state
+	// machine and compact the Raft log whenever that many entries have been
+	// applied since the last snapshot (§7). Zero disables compaction.
+	SnapshotEvery uint64
+}
+
 // NewReplica returns a Replica driving r, which must be newly created: the
-// state machine starts empty and is rebuilt from the entries r commits.
-// Requests that have not completed after requestTimeout ticks fail with
-// ErrTimeout.
-func NewReplica(r *raft.Raft, requestTimeout int) *Replica {
-	if requestTimeout <= 0 {
-		panic("kv: requestTimeout must be positive")
+// state machine starts empty and is rebuilt from r's snapshot, if it has
+// one, and the entries r commits after it.
+func NewReplica(r *raft.Raft, cfg Config) *Replica {
+	if cfg.RequestTimeout <= 0 {
+		panic("kv: RequestTimeout must be positive")
 	}
-	return &Replica{raft: r, sm: NewStateMachine(), timeout: requestTimeout}
+	return &Replica{raft: r, sm: NewStateMachine(), timeout: cfg.RequestTimeout, snapshotEvery: cfg.SnapshotEvery}
 }
 
 // Raft returns the Raft node, for status and tests.
@@ -200,6 +211,17 @@ func (p *Replica) checkLeadership() {
 }
 
 func (p *Replica) applyCommitted() error {
+	if snap := p.raft.TakeSnapshot(); snap != nil {
+		// Only a follower installs a snapshot, or a node at startup, and
+		// neither has requests pending: checkLeadership failed them when
+		// this node stopped leading.
+		if len(p.writes) > 0 {
+			return fmt.Errorf("kv: restoring a snapshot at %d with %d writes pending", snap.Index, len(p.writes))
+		}
+		if err := p.sm.Restore(*snap); err != nil {
+			return err
+		}
+	}
 	for _, e := range p.raft.TakeCommitted() {
 		res, err := p.sm.Apply(e)
 		if err != nil {
@@ -222,7 +244,22 @@ func (p *Replica) applyCommitted() error {
 			w.done(res)
 		}
 	}
-	return nil
+	return p.maybeCompact()
+}
+
+// maybeCompact snapshots the state machine and compacts the log once enough
+// entries have been applied since the last snapshot. Serializing the whole
+// state here, on the only goroutine that runs the Replica, pauses request
+// processing for a time that grows with the size of the state.
+func (p *Replica) maybeCompact() error {
+	if p.snapshotEvery == 0 {
+		return nil
+	}
+	applied := p.sm.Applied()
+	if applied < p.raft.Status().Snapshot+p.snapshotEvery {
+		return nil
+	}
+	return p.raft.Compact(applied, p.sm.Snapshot())
 }
 
 func (p *Replica) finishReads() error {
