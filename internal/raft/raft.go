@@ -56,6 +56,12 @@ type Config struct {
 	// bounds the size of that write.
 	MaxBytesPerMessage int
 
+	// CheckQuorum makes a leader step down when it has not heard from a
+	// majority of the cluster within ElectionTick ticks (thesis §6.2). It
+	// does not affect safety, only how quickly clients of a leader cut off
+	// in a minority learn to go elsewhere.
+	CheckQuorum bool
+
 	Storage   Storage
 	Transport Transport
 	// Rand is the source of randomness for election timeouts. If nil, a
@@ -131,14 +137,20 @@ type Raft struct {
 	reads []pendingRead
 	// readStates holds outcomes not yet returned by TakeReadStates.
 	readStates []ReadState
+	// active records, for CheckQuorum, the peers a leader has heard from in
+	// the current check window.
+	active map[uint64]bool
 
 	electionTick              int
 	heartbeatTick             int
 	maxMsgEntries             int
 	maxMsgBytes               int
+	checkQuorum               bool
 	randomizedElectionTimeout int
-	electionElapsed           int // follower and candidate only
-	heartbeatElapsed          int // leader only
+	// electionElapsed counts ticks toward the election timeout on a
+	// follower or candidate, and toward the next CheckQuorum on a leader.
+	electionElapsed  int
+	heartbeatElapsed int // leader only
 
 	// err is set when Storage fails. Raft then stops: every later call
 	// returns err and nothing more is sent. Continuing after a failed save
@@ -198,6 +210,7 @@ func New(cfg Config) (*Raft, error) {
 		heartbeatTick: cfg.HeartbeatTick,
 		maxMsgEntries: maxEntries,
 		maxMsgBytes:   maxBytes,
+		checkQuorum:   cfg.CheckQuorum,
 	}
 	if snap.Index > 0 {
 		r.pendingSnap = &snap
@@ -350,13 +363,27 @@ func (r *Raft) TakeReadStates() []ReadState {
 // Tick advances the node's logical clock by one tick. A follower or
 // candidate whose election timeout elapses starts an election; a leader
 // sends AppendEntries, carrying any entries a follower is missing, every
-// HeartbeatTick ticks.
+// HeartbeatTick ticks, and with CheckQuorum checks every ElectionTick ticks
+// that it can still reach a majority.
 func (r *Raft) Tick() error {
 	if r.err != nil {
 		return r.err
 	}
 	switch r.state {
 	case Leader:
+		if r.checkQuorum {
+			r.electionElapsed++
+			if r.electionElapsed >= r.electionTick {
+				r.electionElapsed = 0
+				if !r.quorumActive() {
+					// Stay in this term: stepping down is not evidence of
+					// a newer leader. Our own election timer then runs,
+					// and we campaign if no leader contacts us.
+					r.becomeFollower(r.term, None)
+					return r.err
+				}
+			}
+		}
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTick {
 			r.heartbeatElapsed = 0
@@ -617,6 +644,7 @@ func (r *Raft) handleAppendResp(m Message) {
 	p := m.From
 	// Any response in this term, success or rejection, shows the follower
 	// accepted us as leader when it received that round.
+	r.active[p] = true
 	if m.Round > r.acked[p] {
 		r.acked[p] = m.Round
 		r.advanceReads()
@@ -671,6 +699,21 @@ func (r *Raft) maybeCommit() {
 	}
 	r.commit = n
 	r.advanceReads()
+}
+
+// quorumActive reports whether a majority, counting the leader, has
+// answered since the last check, then starts a new window.
+//
+// This is not a lease. Followers on the majority side may elect a new
+// leader after ElectionTick ticks without hearing from us, before we step
+// down at the end of the window, so for a while two nodes act as leader in
+// different terms. Only one of them can commit, and reads stay safe
+// because ReadIndex still confirms each read with a heartbeat round. A lease
+// would need bounds on clock drift between nodes (thesis §6.4.1).
+func (r *Raft) quorumActive() bool {
+	n := 1 + len(r.active) // active never holds ourselves
+	clear(r.active)
+	return n >= len(r.peers)/2+1
 }
 
 func (r *Raft) committedCurrentTerm() bool {
@@ -821,6 +864,9 @@ func (r *Raft) becomeLeader() {
 	}
 	r.match[r.id] = r.lastIndex()
 	r.acked = make(map[uint64]uint64, len(r.peers))
+	// A full window to hear from a majority, counting only this term.
+	r.active = make(map[uint64]bool, len(r.peers))
+	r.electionElapsed = 0
 	// §8: start the term with a no-op entry. Entries from earlier terms can
 	// only commit once an entry from this term does (see maybeCommit), so
 	// without it they could wait indefinitely for the next client command.
