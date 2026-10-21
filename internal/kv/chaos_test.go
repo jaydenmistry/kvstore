@@ -134,7 +134,7 @@ func TestLinearizableUnderChaos(t *testing.T) {
 	const seeds = 100
 	var completed, writes, reads int
 	for seed := range uint64(seeds) {
-		c := newCluster(t, 5, seed, seed%2 == 1)
+		c := newCluster(t, 5, seed, seed%2 == 1, withCheckQuorum(seed/4%2 == 1))
 		// A third of the runs never compact, a third compact often.
 		c.setSnapshotEvery([]uint64{0, 5, 50}[seed%3])
 		rng := rand.New(rand.NewPCG(seed, 4))

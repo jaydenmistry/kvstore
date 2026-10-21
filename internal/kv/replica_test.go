@@ -270,6 +270,24 @@ func TestRequestsTimeOut(t *testing.T) {
 	}
 }
 
+func TestCheckQuorumFailsRequestsBeforeTimeout(t *testing.T) {
+	// With CheckQuorum, the isolated leader in TestRequestsTimeOut steps
+	// down within two election windows, well before the request timeout, and
+	// its pending requests fail so clients can look for the new leader.
+	c := newCluster(t, 3, 1, false, withCheckQuorum(true))
+	l := c.leader()
+	c.net.Partition([]uint64{l}, others(c.ids, l))
+	get, put := c.submit(l, getReq("k")), c.submit(l, putReq(1, 1, "k", "v"))
+	c.run(2 * electionTick)
+	if !errors.Is(get.res.Err, ErrLeadershipLost) || !errors.Is(put.res.Err, ErrLeadershipLost) {
+		t.Fatalf("get %+v, put %+v; want ErrLeadershipLost", get.res, put.res)
+	}
+	// It no longer accepts requests, and knows no leader to redirect to.
+	if res := c.wait(c.submit(l, getReq("k")), 1); !errors.Is(res.Err, ErrNotLeader) || res.Leader != raft.None {
+		t.Fatalf("get on stepped-down leader: %+v, want ErrNotLeader with no leader hint", res)
+	}
+}
+
 func TestLeadershipLossFailsPendingRequests(t *testing.T) {
 	c := newCluster(t, 3, 1, false)
 	l := c.leader()
