@@ -11,7 +11,8 @@ import (
 func TestElectsOneStableLeader(t *testing.T) {
 	for _, n := range []int{1, 3, 5} {
 		for seed := range uint64(50) {
-			c := newCluster(t, n, seed)
+			// CheckQuorum must not depose a leader that can reach everyone.
+			c := newCluster(t, n, seed, withCheckQuorum(seed%2 == 1))
 			lead := c.waitForLeader(20 * electionTick)
 			term := c.nodes[lead].Status().Term
 
@@ -57,6 +58,56 @@ func TestNewLeaderAfterLeaderPartitioned(t *testing.T) {
 			if s := c.nodes[old].Status(); s.Term <= oldTerm {
 				c.fatalf("old leader still in term %d after healing", s.Term)
 			}
+		}
+	}
+}
+
+func TestCheckQuorumDeposesIsolatedLeader(t *testing.T) {
+	// Without CheckQuorum, an isolated leader stays leader for as long as
+	// it is cut off (TestNewLeaderAfterLeaderPartitioned). With it, the
+	// leader steps down within two ElectionTick windows, whether it is
+	// alone or with one follower in a cluster of five. Its term does not
+	// change until it campaigns.
+	for _, n := range []int{3, 5} {
+		for seed := range uint64(30) {
+			c := newCluster(t, n, seed, withCheckQuorum(true))
+			old := c.waitForLeader(20 * electionTick)
+			oldTerm := c.nodes[old].Status().Term
+			minority := []uint64{old}
+			if n == 5 {
+				minority = append(minority, others(c.ids, old)[0])
+			}
+			majority := others(c.ids, minority...)
+			c.net.Partition(minority, majority)
+
+			stepped := false
+			for range 2 * electionTick {
+				c.tick()
+				if s := c.nodes[old].Status(); s.State != raft.Leader {
+					if s.Term != oldTerm {
+						c.fatalf("old leader moved from term %d to %d on stepping down", oldTerm, s.Term)
+					}
+					stepped = true
+					break
+				}
+			}
+			if !stepped {
+				c.fatalf("isolated leader %d still leads after %d ticks: %s", old, 2*electionTick, c.describe())
+			}
+			lead := c.leaderAmong(majority, 20*electionTick)
+			for range 10 * electionTick {
+				c.tick()
+				for _, id := range minority {
+					if c.nodes[id].Status().State == raft.Leader {
+						c.fatalf("node %d in the minority became leader", id)
+					}
+				}
+			}
+			if l := c.leaderAmong(majority, 1); l != lead {
+				c.fatalf("majority leader changed from %d to %d during the partition", lead, l)
+			}
+			c.net.Heal()
+			c.waitForLeader(20 * electionTick)
 		}
 	}
 }
@@ -127,7 +178,7 @@ func TestNoTwoLeadersInSameTermUnderChaos(t *testing.T) {
 	delays := []int{4, 2 * electionTick}
 	elections := make([]int, len(delays))
 	for seed := range uint64(seeds) {
-		c := newCluster(t, 5, seed)
+		c := newCluster(t, 5, seed, withCheckQuorum(seed/2%2 == 1))
 		rng := rand.New(rand.NewPCG(seed, 2))
 		c.net.SetDropRate(0.2)
 		c.net.SetDuplicateRate(0.1)

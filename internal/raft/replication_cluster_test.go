@@ -188,10 +188,11 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 	var proposed, committed, installed int
 	for seed := range uint64(seeds) {
 		var c *cluster
+		quorum := withCheckQuorum(seed/4%2 == 1)
 		if seed%2 == 0 {
-			c = newCluster(t, 5, seed)
+			c = newCluster(t, 5, seed, quorum)
 		} else {
-			c = newDiskCluster(t, 5, seed)
+			c = newDiskCluster(t, 5, seed, quorum)
 		}
 		// A third of the runs never compact, a third compact often.
 		c.compactEvery = []int{0, 7, 30}[seed%3]

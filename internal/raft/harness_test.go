@@ -69,19 +69,28 @@ type cluster struct {
 	// installed counts snapshots restored by running nodes, which come
 	// from InstallSnapshot (not from a restart).
 	installed int
+	// checkQuorum is passed to every node's Config.
+	checkQuorum bool
 }
 
-func newCluster(t *testing.T, n int, seed uint64) *cluster {
-	return buildCluster(t, n, seed, false)
+// clusterOption configures a cluster before its nodes start.
+type clusterOption func(*cluster)
+
+func withCheckQuorum(on bool) clusterOption {
+	return func(c *cluster) { c.checkQuorum = on }
+}
+
+func newCluster(t *testing.T, n int, seed uint64, opts ...clusterOption) *cluster {
+	return buildCluster(t, n, seed, false, opts)
 }
 
 // newDiskCluster is like newCluster, but nodes persist through DiskStorage
 // and the WAL, and crash by losing power.
-func newDiskCluster(t *testing.T, n int, seed uint64) *cluster {
-	return buildCluster(t, n, seed, true)
+func newDiskCluster(t *testing.T, n int, seed uint64, opts ...clusterOption) *cluster {
+	return buildCluster(t, n, seed, true, opts)
 }
 
-func buildCluster(t *testing.T, n int, seed uint64, disk bool) *cluster {
+func buildCluster(t *testing.T, n int, seed uint64, disk bool, opts []clusterOption) *cluster {
 	t.Helper()
 	c := &cluster{
 		t:             t,
@@ -100,6 +109,9 @@ func buildCluster(t *testing.T, n int, seed uint64, disk bool) *cluster {
 	}
 	if disk {
 		c.disks = make(map[uint64]*vfs.Mem)
+	}
+	for _, o := range opts {
+		o(c)
 	}
 	for i := range n {
 		id := uint64(i + 1)
@@ -138,6 +150,7 @@ func (c *cluster) start(id uint64) {
 		Peers:         c.ids,
 		ElectionTick:  electionTick,
 		HeartbeatTick: heartbeatTick,
+		CheckQuorum:   c.checkQuorum,
 		Storage:       c.storage[id],
 		Transport:     c.net.Endpoint(id),
 		Rand:          rand.New(rand.NewPCG(c.rng.Uint64(), id)),
