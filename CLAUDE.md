@@ -60,6 +60,11 @@ Create packages only when the phase that needs them begins.
   entry from its current term, then a majority must answer a heartbeat round
   started after the read. Never serve reads from local state, and never from a
   follower.
+- CheckQuorum (thesis §6.2): a leader that has not heard from a majority
+  (any AppendEntries response in its term) within an ElectionTick window
+  steps down, staying in its term. It is a liveness aid, not a lease: reads
+  still need the ReadIndex round. kvserver always enables it; tests run with
+  it on and off, so safety is never shown only with it on.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
