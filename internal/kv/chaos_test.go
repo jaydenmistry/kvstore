@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/jaydenmistry/kvstore/internal/linearize"
 )
 
 // simClient is a client that behaves as a real one should: one request at a
@@ -20,7 +22,7 @@ type simClient struct {
 	id  uint64
 	seq uint64
 
-	cur      *histOp // the operation in progress, nil when idle
+	cur      *linearize.Op // the operation in progress, nil when idle
 	req      Request
 	target   uint64 // node to send the next attempt to; 0 for any
 	attempt  int    // incremented per attempt; older callbacks are ignored
@@ -30,11 +32,11 @@ type simClient struct {
 
 // history numbers events so operations can be ordered in real time.
 type history struct {
-	events int
-	ops    []histOp
+	events int64
+	ops    []linearize.Op
 }
 
-func (h *history) event() int {
+func (h *history) event() int64 {
 	h.events++
 	return h.events
 }
@@ -54,19 +56,19 @@ func (cl *simClient) step(start bool) {
 			return
 		}
 		key := keys[cl.rng.IntN(len(keys))]
-		cl.cur = &histOp{client: cl.id, key: key, call: cl.h.event()}
+		cl.cur = &linearize.Op{Client: cl.id, Key: key, Call: cl.h.event()}
 		switch p := cl.rng.IntN(100); {
 		case p < 50:
-			cl.cur.op = OpGet
+			cl.cur.Kind = linearize.Get
 			cl.req = getReq(key)
 		case p < 85:
 			cl.seq++
 			v := fmt.Sprintf("c%d-%d", cl.id, cl.seq)
-			cl.cur.op, cl.cur.value = OpPut, v
+			cl.cur.Kind, cl.cur.Value = linearize.Put, v
 			cl.req = putReq(cl.id, cl.seq, key, v)
 		default:
 			cl.seq++
-			cl.cur.op = OpDelete
+			cl.cur.Kind = linearize.Delete
 			cl.req = deleteReq(cl.id, cl.seq, key)
 		}
 		cl.waiting = false
@@ -106,10 +108,10 @@ func (cl *simClient) handle(res Result) {
 	switch {
 	case res.Err == nil:
 		o := cl.cur
-		o.ret = cl.h.event()
-		o.found = res.Found
-		if o.op == OpGet {
-			o.value = string(res.Value)
+		o.Return = cl.h.event()
+		o.Found = res.Found
+		if o.Kind == linearize.Get {
+			o.Value = string(res.Value)
 		}
 		cl.h.ops = append(cl.h.ops, *o)
 		cl.cur, cl.waiting = nil, false
@@ -196,12 +198,12 @@ func TestLinearizableUnderChaos(t *testing.T) {
 			c.tick()
 		}
 
-		if ok, bad := checkLinearizable(h.ops); !ok {
+		if ok, bad := linearize.Check(h.ops); !ok {
 			var b strings.Builder
 			for _, o := range bad {
 				fmt.Fprintln(&b, o)
 			}
-			c.fatalf("history for key %q is not linearizable:\n%s", bad[0].key, b.String())
+			c.fatalf("history for key %q is not linearizable:\n%s", bad[0].Key, b.String())
 		}
 		lead := c.leader()
 		c.waitApplied(c.nodes[lead].sm.Applied(), 20*electionTick)
@@ -209,7 +211,7 @@ func TestLinearizableUnderChaos(t *testing.T) {
 
 		completed += len(h.ops)
 		for _, o := range h.ops {
-			if o.op == OpGet {
+			if o.Kind == linearize.Get {
 				reads++
 			} else {
 				writes++
