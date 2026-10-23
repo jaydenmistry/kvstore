@@ -36,8 +36,9 @@ type cluster struct {
 	disks map[uint64]*vfs.Mem
 	// snapshotEvery is passed to every Replica; see setSnapshotEvery.
 	snapshotEvery uint64
-	// checkQuorum is passed to every node's raft.Config.
+	// checkQuorum and preVote are passed to every node's raft.Config.
 	checkQuorum bool
+	preVote     bool
 }
 
 // clusterOption configures a cluster before its nodes start.
@@ -45,6 +46,10 @@ type clusterOption func(*cluster)
 
 func withCheckQuorum(on bool) clusterOption {
 	return func(c *cluster) { c.checkQuorum = on }
+}
+
+func withPreVote(on bool) clusterOption {
+	return func(c *cluster) { c.preVote = on }
 }
 
 // setSnapshotEvery sets how often every node, running or restarted later,
@@ -112,6 +117,7 @@ func (c *cluster) start(id uint64) {
 		ElectionTick:  electionTick,
 		HeartbeatTick: heartbeatTick,
 		CheckQuorum:   c.checkQuorum,
+		PreVote:       c.preVote,
 		Storage:       c.storage[id],
 		Transport:     c.net.Endpoint(id),
 		Rand:          rand.New(rand.NewPCG(c.rng.Uint64(), id)),
