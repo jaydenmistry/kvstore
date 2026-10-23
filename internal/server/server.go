@@ -130,10 +130,12 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		Peers:         ids,
 		ElectionTick:  cfg.ElectionTick,
 		HeartbeatTick: cfg.HeartbeatTick,
-		// Without it, a leader cut off from the majority keeps accepting
-		// requests until they time out. Tests turn it off to show that
-		// safety never depends on it.
+		// Without CheckQuorum, a leader cut off from the majority keeps
+		// accepting requests until they time out. Without PreVote, a node
+		// that loses touch with the leader deposes it when it reconnects.
+		// Tests turn both off to show that safety never depends on them.
 		CheckQuorum: true,
+		PreVote:     true,
 		Storage:     storage,
 		Transport:   tr,
 	})
