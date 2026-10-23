@@ -28,6 +28,9 @@ const (
 	Follower State = iota
 	Candidate
 	Leader
+	// PreCandidate is a node asking whether it could win an election
+	// before starting one (PreVote, thesis §9.6). It keeps its term.
+	PreCandidate
 )
 
 func (s State) String() string {
@@ -38,6 +41,8 @@ func (s State) String() string {
 		return "candidate"
 	case Leader:
 		return "leader"
+	case PreCandidate:
+		return "pre-candidate"
 	}
 	return "unknown"
 }
@@ -60,6 +65,13 @@ const (
 	// when a follower needs entries the leader has compacted. Its response
 	// is a MsgAppResp whose MatchIndex is the snapshot's index.
 	MsgSnap
+	// MsgPreVote asks whether the receiver would vote for the sender in
+	// the message's term, which is one past the sender's own (thesis §9.6).
+	// Neither side changes its term or vote.
+	MsgPreVote
+	// MsgPreVoteResp is the response to MsgPreVote. A grant carries the
+	// term asked about; a refusal carries the voter's own term.
+	MsgPreVoteResp
 )
 
 func (t MessageType) String() string {
@@ -74,6 +86,10 @@ func (t MessageType) String() string {
 		return "MsgAppResp"
 	case MsgSnap:
 		return "MsgSnap"
+	case MsgPreVote:
+		return "MsgPreVote"
+	case MsgPreVoteResp:
+		return "MsgPreVoteResp"
 	}
 	return "MsgUnknown"
 }
@@ -88,15 +104,17 @@ type Message struct {
 	From uint64
 	To   uint64
 	// Term is the sender's current term. Every message carries it, and a
-	// receiver that sees a higher term adopts it (§5.1).
+	// receiver that sees a higher term adopts it (§5.1). The exceptions are
+	// MsgPreVote and a granted MsgPreVoteResp, which carry a term no one
+	// has entered yet; see their types.
 	Term uint64
 
-	// MsgVote: the candidate's last log entry, for the election
-	// restriction (§5.4.1).
+	// MsgVote and MsgPreVote: the candidate's last log entry, for the
+	// election restriction (§5.4.1).
 	LastLogIndex uint64
 	LastLogTerm  uint64
 
-	// MsgVoteResp: whether the vote was granted.
+	// MsgVoteResp and MsgPreVoteResp: whether the vote was granted.
 	VoteGranted bool
 
 	// MsgApp: the entry just before Entries, which the follower must

@@ -61,6 +61,13 @@ type Config struct {
 	// does not affect safety, only how quickly clients of a leader cut off
 	// in a minority learn to go elsewhere.
 	CheckQuorum bool
+	// PreVote makes a node whose election timeout elapses first ask
+	// whether it could win, and start an election only if a majority says
+	// yes (thesis §9.6). A node cut off from the cluster then keeps its
+	// term, instead of raising it with every timeout and deposing a working
+	// leader when it reconnects. With CheckQuorum also on, a node that has
+	// heard from a leader within ElectionTick ticks says no.
+	PreVote bool
 
 	Storage   Storage
 	Transport Transport
@@ -118,8 +125,8 @@ type Raft struct {
 
 	state State
 	lead  uint64 // leader of the current term, if known
-	// votes records the vote responses a candidate has received in the
-	// current term. It is a set keyed by node, so a duplicated response is
+	// votes records the vote responses a candidate, or pre-candidate, has
+	// received in the current term. It is a set keyed by node, so a duplicated response is
 	// counted once.
 	votes map[uint64]bool
 
@@ -146,6 +153,7 @@ type Raft struct {
 	maxMsgEntries             int
 	maxMsgBytes               int
 	checkQuorum               bool
+	preVote                   bool
 	randomizedElectionTimeout int
 	// electionElapsed counts ticks toward the election timeout on a
 	// follower or candidate, and toward the next CheckQuorum on a leader.
@@ -211,6 +219,7 @@ func New(cfg Config) (*Raft, error) {
 		maxMsgEntries: maxEntries,
 		maxMsgBytes:   maxBytes,
 		checkQuorum:   cfg.CheckQuorum,
+		preVote:       cfg.PreVote,
 	}
 	if snap.Index > 0 {
 		r.pendingSnap = &snap
@@ -389,10 +398,14 @@ func (r *Raft) Tick() error {
 			r.heartbeatElapsed = 0
 			r.broadcastAppend()
 		}
-	case Follower, Candidate:
+	case Follower, Candidate, PreCandidate:
 		r.electionElapsed++
 		if r.electionElapsed >= r.randomizedElectionTimeout {
-			r.campaign()
+			if r.preVote {
+				r.preCampaign()
+			} else {
+				r.campaign()
+			}
 		}
 	}
 	return r.err
@@ -409,6 +422,21 @@ func (r *Raft) Step(m Message) error {
 	}
 	if m.To != r.id || m.From == r.id || !slices.Contains(r.peers, m.From) {
 		return nil
+	}
+
+	// A pre-vote request, and a grant, carry a term the sender has not
+	// entered: the one it would campaign in. Adopting it would raise our
+	// term with nobody campaigning, the very disruption PreVote prevents,
+	// so these skip the term rules below. A refusal carries the voter's
+	// own term and goes through them, so a pre-candidate that has fallen
+	// behind learns the current term.
+	if m.Type == MsgPreVote {
+		r.handlePreVote(m)
+		return r.err
+	}
+	if m.Type == MsgPreVoteResp && m.VoteGranted {
+		r.handlePreVoteResp(m)
+		return r.err
 	}
 
 	switch {
@@ -450,8 +478,82 @@ func (r *Raft) Step(m Message) error {
 		r.handleAppendResp(m)
 	case MsgSnap:
 		r.handleSnapshot(m)
+	case MsgPreVoteResp:
+		r.handlePreVoteResp(m)
 	}
 	return r.err
+}
+
+// preCampaign asks every peer whether it would vote for us in the next term
+// (PreVote, thesis §9.6). Nothing is persisted: our term and vote do not
+// change. If a majority says yes, we start a real election with campaign.
+func (r *Raft) preCampaign() {
+	r.state = PreCandidate
+	r.lead = None
+	r.votes = map[uint64]bool{r.id: true}
+	r.resetElectionTimer()
+	if r.wonElection() {
+		r.campaign() // single-node cluster
+		return
+	}
+	for _, p := range r.peers {
+		if p != r.id {
+			r.send(Message{
+				Type:         MsgPreVote,
+				To:           p,
+				Term:         r.term + 1,
+				LastLogIndex: r.lastIndex(),
+				LastLogTerm:  r.lastTerm(),
+			})
+		}
+	}
+}
+
+// handlePreVote answers whether we would vote for the sender in m.Term. It
+// changes nothing here: the answer is a prediction, and a real MsgVote is
+// still decided by handleVote.
+func (r *Raft) handlePreVote(m Message) {
+	// A node already in m.Term or later has moved past the term the sender
+	// would campaign in. It says no, with its own term, so the sender
+	// catches up.
+	grant := m.Term > r.term &&
+		!r.inLeaderLease() &&
+		isUpToDate(m.LastLogTerm, m.LastLogIndex, r.lastTerm(), r.lastIndex())
+	if !grant {
+		r.send(Message{Type: MsgPreVoteResp, To: m.From})
+		return
+	}
+	r.send(Message{Type: MsgPreVoteResp, To: m.From, Term: m.Term, VoteGranted: true})
+}
+
+// inLeaderLease reports whether, with CheckQuorum on, we are the leader or
+// have heard from one within the last ElectionTick ticks. Such a node
+// refuses pre-votes (leader stickiness, thesis §4.2.3): the leader looks
+// alive, so a node that wants an election is the one cut off.
+//
+// Without CheckQuorum this could keep a cluster without a usable leader
+// forever. Say the leader's messages reach follower A but nothing from A
+// reaches it, and the leader is cut off from B entirely. The leader cannot
+// commit, A keeps hearing from it and refuses B, and B can never win. With
+// CheckQuorum, the leader steps down within two ElectionTick windows and A
+// stops hearing from it.
+func (r *Raft) inLeaderLease() bool {
+	return r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTick
+}
+
+func (r *Raft) handlePreVoteResp(m Message) {
+	if r.state != PreCandidate {
+		return
+	}
+	// A grant for any other term answers an earlier pre-campaign, made
+	// from an older term.
+	if m.VoteGranted && m.Term != r.term+1 {
+		return
+	}
+	r.votes[m.From] = m.VoteGranted
+	if r.wonElection() {
+		r.campaign()
+	}
 }
 
 // campaign starts an election (§5.2): increment the term, vote for
@@ -526,8 +628,9 @@ func (r *Raft) followLeader(m Message) bool {
 		// different candidates, which the vote rules make impossible. If it
 		// happens, a safety invariant is already broken.
 		panic(fmt.Sprintf("raft: node %d is leader in term %d but received %v from %d", r.id, r.term, m.Type, m.From))
-	case Candidate:
-		// §5.2: another node won this term's election.
+	case Candidate, PreCandidate:
+		// §5.2: another node won this term's election, or, for a
+		// pre-candidate, the leader we thought was gone is still there.
 		if !r.becomeFollower(r.term, m.From) {
 			return false
 		}
@@ -900,9 +1003,13 @@ func (r *Raft) persist(term, vote uint64) bool {
 	return true
 }
 
+// send sends m from this node. m.Term defaults to our current term; only
+// pre-vote messages set it explicitly.
 func (r *Raft) send(m Message) {
 	m.From = r.id
-	m.Term = r.term
+	if m.Term == 0 {
+		m.Term = r.term
+	}
 	r.transport.Send(m)
 }
 
