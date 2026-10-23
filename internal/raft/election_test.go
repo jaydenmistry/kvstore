@@ -12,7 +12,7 @@ func TestElectsOneStableLeader(t *testing.T) {
 	for _, n := range []int{1, 3, 5} {
 		for seed := range uint64(50) {
 			// CheckQuorum must not depose a leader that can reach everyone.
-			c := newCluster(t, n, seed, withCheckQuorum(seed%2 == 1))
+			c := newCluster(t, n, seed, withCheckQuorum(seed%2 == 1), withPreVote(seed/2%2 == 1))
 			lead := c.waitForLeader(20 * electionTick)
 			term := c.nodes[lead].Status().Term
 
@@ -178,7 +178,7 @@ func TestNoTwoLeadersInSameTermUnderChaos(t *testing.T) {
 	delays := []int{4, 2 * electionTick}
 	elections := make([]int, len(delays))
 	for seed := range uint64(seeds) {
-		c := newCluster(t, 5, seed, withCheckQuorum(seed/2%2 == 1))
+		c := newCluster(t, 5, seed, withCheckQuorum(seed/2%2 == 1), withPreVote(seed/4%2 == 1))
 		rng := rand.New(rand.NewPCG(seed, 2))
 		c.net.SetDropRate(0.2)
 		c.net.SetDuplicateRate(0.1)

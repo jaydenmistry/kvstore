@@ -69,8 +69,9 @@ type cluster struct {
 	// installed counts snapshots restored by running nodes, which come
 	// from InstallSnapshot (not from a restart).
 	installed int
-	// checkQuorum is passed to every node's Config.
+	// checkQuorum and preVote are passed to every node's Config.
 	checkQuorum bool
+	preVote     bool
 }
 
 // clusterOption configures a cluster before its nodes start.
@@ -78,6 +79,10 @@ type clusterOption func(*cluster)
 
 func withCheckQuorum(on bool) clusterOption {
 	return func(c *cluster) { c.checkQuorum = on }
+}
+
+func withPreVote(on bool) clusterOption {
+	return func(c *cluster) { c.preVote = on }
 }
 
 func newCluster(t *testing.T, n int, seed uint64, opts ...clusterOption) *cluster {
@@ -151,6 +156,7 @@ func (c *cluster) start(id uint64) {
 		ElectionTick:  electionTick,
 		HeartbeatTick: heartbeatTick,
 		CheckQuorum:   c.checkQuorum,
+		PreVote:       c.preVote,
 		Storage:       c.storage[id],
 		Transport:     c.net.Endpoint(id),
 		Rand:          rand.New(rand.NewPCG(c.rng.Uint64(), id)),
