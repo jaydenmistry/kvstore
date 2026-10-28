@@ -170,9 +170,15 @@ func (s *Server) Run(ctx context.Context) error {
 	err := s.loop(ctx)
 	close(s.stopped)
 
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Requests still waiting on the loop fail with errStopped at once, so
+	// a graceful shutdown only waits for responses being written, and for
+	// connections that never sent a request: net/http waits up to 5 s for
+	// those, which a node going down has no reason to do.
+	shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	s.http.Shutdown(shutdown)
+	if s.http.Shutdown(shutdown) != nil {
+		s.http.Close()
+	}
 	if e := <-httpErr; e != nil && !errors.Is(e, http.ErrServerClosed) && err == nil {
 		err = fmt.Errorf("server: HTTP: %w", e)
 	}
