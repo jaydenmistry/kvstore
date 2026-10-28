@@ -203,3 +203,33 @@ func TestKeysReachServerIntact(t *testing.T) {
 		t.Fatalf("server saw keys %q, want %q", got, keys)
 	}
 }
+
+func TestSpreadStartsAtRandomServers(t *testing.T) {
+	var servers []string
+	var fakes []*fake
+	for range 3 {
+		f := newFake(t, func(w http.ResponseWriter, r *http.Request, n int) { w.WriteHeader(http.StatusNoContent) })
+		fakes = append(fakes, f)
+		servers = append(servers, f.URL)
+	}
+	c := newClient(t, servers...)
+	for range 10 {
+		if err := c.Put(ctx(t), "k", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(fakes[0].requests()); n != 10 {
+		t.Fatalf("without Spread, the first server got %d of 10 requests", n)
+	}
+	c.Spread = true
+	for range 300 {
+		if err := c.Put(ctx(t), "k", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, f := range fakes {
+		if len(f.requests()) < 40 {
+			t.Fatalf("with Spread, server %d got %d requests", i, len(f.requests()))
+		}
+	}
+}

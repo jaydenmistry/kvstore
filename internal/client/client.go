@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -40,6 +41,12 @@ type Client struct {
 	// bound the wait between attempts that found no leader.
 	AttemptTimeout         time.Duration
 	MinBackoff, MaxBackoff time.Duration
+	// Spread, if set, sends each request first to a random server rather
+	// than the last known leader, as a client behind a load balancer
+	// would. Followers redirect it, so it costs a round trip most of the
+	// time. Tests use it to reach deposed leaders and followers with stale
+	// views, which a client that sticks to the leader rarely does.
+	Spread bool
 
 	mu     sync.Mutex
 	seq    uint64
@@ -120,6 +127,9 @@ func (c *Client) do(ctx context.Context, method, key string, body []byte) ([]byt
 		// One sequence number per write, kept for every retry.
 		c.seq++
 		seq = c.seq
+	}
+	if c.Spread {
+		c.leader, c.next = "", mrand.IntN(len(c.servers))
 	}
 	backoff := c.MinBackoff
 	redirects := 0
