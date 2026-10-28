@@ -56,13 +56,18 @@ func run() int {
 	dataDir := flag.String("data", "", "data `directory`")
 	tick := flag.Duration("tick", server.DefaultTickInterval, "Raft tick `interval`")
 	snapEvery := flag.Int("snapshot-every", server.DefaultSnapshotEvery, "compact the log after this many applied `entries`; negative disables")
+	checkQuorum := flag.Bool("check-quorum", true, "leaders step down when cut off from a majority; turn off only for testing")
+	preVote := flag.Bool("pre-vote", true, "nodes check they could win before starting an election; turn off only for testing")
 	flag.Parse()
 	if flag.NArg() > 0 || *id == 0 || *dataDir == "" || (len(peers) == 0) == (*configPath == "") {
 		fmt.Fprintln(os.Stderr, "kvserver: -id and -data are required, and exactly one of -config or -peer")
 		flag.Usage()
 		return exitUsage
 	}
-	cfg := server.Config{ID: *id, Peers: peers, DataDir: *dataDir, TickInterval: *tick, SnapshotEvery: *snapEvery}
+	cfg := server.Config{
+		ID: *id, Peers: peers, DataDir: *dataDir, TickInterval: *tick, SnapshotEvery: *snapEvery,
+		DisableCheckQuorum: !*checkQuorum, DisablePreVote: !*preVote,
+	}
 	if *configPath != "" {
 		c, err := config.Load(*configPath)
 		if err != nil {

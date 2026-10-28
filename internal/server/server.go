@@ -48,6 +48,11 @@ type Config struct {
 	// SnapshotEvery is how many applied entries trigger a snapshot and log
 	// compaction. Zero means DefaultSnapshotEvery; negative disables it.
 	SnapshotEvery int
+	// DisableCheckQuorum and DisablePreVote turn off those Raft options,
+	// which are on by default. Neither affects safety, so tests turn them
+	// off to show that; leave them on otherwise.
+	DisableCheckQuorum bool
+	DisablePreVote     bool
 
 	Logger *slog.Logger
 }
@@ -133,9 +138,8 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		// Without CheckQuorum, a leader cut off from the majority keeps
 		// accepting requests until they time out. Without PreVote, a node
 		// that loses touch with the leader deposes it when it reconnects.
-		// Tests turn both off to show that safety never depends on them.
-		CheckQuorum: true,
-		PreVote:     true,
+		CheckQuorum: !cfg.DisableCheckQuorum,
+		PreVote:     !cfg.DisablePreVote,
 		Storage:     storage,
 		Transport:   tr,
 	})
