@@ -1,12 +1,17 @@
 // Command kvserver runs one node of a kvstore cluster.
 //
+//	kvserver -config /etc/kvstore/cluster.json -id 1 -data /var/lib/kvstore
+//
+// The config file lists every member and the cluster's timing (see package
+// config); every node needs the same file. Instead of a file, members can be
+// given with -peer, one per member, including this node:
+//
 //	kvserver -id 1 -data /var/lib/kvstore \
 //	    -peer 1=10.0.0.1:7001,10.0.0.1:8001 \
 //	    -peer 2=10.0.0.2:7001,10.0.0.2:8001 \
 //	    -peer 3=10.0.0.3:7001,10.0.0.3:8001
 //
-// Each -peer gives a member's Raft address and client API address. Every
-// node needs the same list, including itself.
+// -tick and -snapshot-every, if given, override the file.
 //
 // Exit status is 0 after SIGINT or SIGTERM, 2 for bad usage, 1 if the node
 // could not start, and 3 (exitFatal) if storage or the state machine failed.
@@ -28,7 +33,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/jaydenmistry/kvstore/internal/config"
 	"github.com/jaydenmistry/kvstore/internal/server"
 	"github.com/jaydenmistry/kvstore/internal/vfs"
 )
@@ -43,23 +50,48 @@ func main() { os.Exit(run()) }
 
 func run() int {
 	peers := peerFlag{}
+	configPath := flag.String("config", "", "cluster configuration `file`")
 	id := flag.Uint64("id", 0, "this node's `ID`")
 	flag.Var(peers, "peer", "cluster member as `ID=RAFT_ADDR,API_ADDR`; repeat for every member, including this node")
 	dataDir := flag.String("data", "", "data `directory`")
 	tick := flag.Duration("tick", server.DefaultTickInterval, "Raft tick `interval`")
 	snapEvery := flag.Int("snapshot-every", server.DefaultSnapshotEvery, "compact the log after this many applied `entries`; negative disables")
 	flag.Parse()
-	if flag.NArg() > 0 || *id == 0 || *dataDir == "" || len(peers) == 0 {
-		fmt.Fprintln(os.Stderr, "kvserver: -id, -data, and -peer are required")
+	if flag.NArg() > 0 || *id == 0 || *dataDir == "" || (len(peers) == 0) == (*configPath == "") {
+		fmt.Fprintln(os.Stderr, "kvserver: -id and -data are required, and exactly one of -config or -peer")
 		flag.Usage()
 		return exitUsage
 	}
-	self, ok := peers[*id]
+	cfg := server.Config{ID: *id, Peers: peers, DataDir: *dataDir, TickInterval: *tick, SnapshotEvery: *snapEvery}
+	if *configPath != "" {
+		c, err := config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kvserver: %v\n", err)
+			return exitUsage
+		}
+		cfg.Peers = c.Peers()
+		cfg.TickInterval = time.Duration(c.Tick)
+		cfg.ElectionTick = c.ElectionTick
+		cfg.HeartbeatTick = c.HeartbeatTick
+		cfg.RequestTimeout = time.Duration(c.RequestTimeout)
+		cfg.SnapshotEvery = c.SnapshotEvery
+		// Flags given explicitly override the file.
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "tick":
+				cfg.TickInterval = *tick
+			case "snapshot-every":
+				cfg.SnapshotEvery = *snapEvery
+			}
+		})
+	}
+	self, ok := cfg.Peers[*id]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "kvserver: no -peer entry for this node's ID %d\n", *id)
+		fmt.Fprintf(os.Stderr, "kvserver: node %d is not a cluster member\n", *id)
 		return exitUsage
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	cfg.Logger = log
 
 	if err := mkdirDurable(*dataDir); err != nil {
 		log.Error("creating data directory", "err", err)
@@ -75,14 +107,7 @@ func run() int {
 		log.Error("listening for clients", "err", err)
 		return exitError
 	}
-	s, err := server.New(server.Config{
-		ID:            *id,
-		Peers:         peers,
-		DataDir:       *dataDir,
-		TickInterval:  *tick,
-		SnapshotEvery: *snapEvery,
-		Logger:        log,
-	}, raftLn, apiLn)
+	s, err := server.New(cfg, raftLn, apiLn)
 	if err != nil {
 		return failed(log, err)
 	}

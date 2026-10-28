@@ -5,7 +5,8 @@
 //	kvctl delete KEY       remove KEY
 //	kvctl status           show each server's Raft state
 //
-// Servers come from -servers or $KVCTL_SERVERS, as comma-separated base URLs.
+// Servers come from -config (the cluster configuration file), -servers, or
+// $KVCTL_SERVERS, as comma-separated base URLs, in that order of preference.
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jaydenmistry/kvstore/internal/client"
+	"github.com/jaydenmistry/kvstore/internal/config"
 	"github.com/jaydenmistry/kvstore/internal/server"
 )
 
@@ -34,6 +36,7 @@ func run() int {
 		servers = env
 	}
 	flag.StringVar(&servers, "servers", servers, "comma-separated server `URLs`")
+	configPath := flag.String("config", "", "cluster configuration `file` to take the servers from")
 	timeout := flag.Duration("timeout", 10*time.Second, "give up after this `long`")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: kvctl [flags] get KEY | put KEY VALUE | delete KEY | status")
@@ -41,6 +44,13 @@ func run() int {
 	}
 	flag.Parse()
 	urls := strings.Split(servers, ",")
+	if *configPath != "" {
+		c, err := config.Load(*configPath)
+		if err != nil {
+			return fail(err)
+		}
+		urls = c.APIURLs()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
