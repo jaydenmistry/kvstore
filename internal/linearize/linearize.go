@@ -22,6 +22,18 @@ const (
 	Delete
 )
 
+func (k Kind) String() string {
+	switch k {
+	case Get:
+		return "get"
+	case Put:
+		return "put"
+	case Delete:
+		return "delete"
+	}
+	return "unknown"
+}
+
 // Op is one logical client operation, from the moment the client first sent
 // it to the moment it learned the outcome, across all its retries.
 //
@@ -38,7 +50,8 @@ type Op struct {
 }
 
 // Pending is the Return of an operation whose outcome was never learned. A
-// pending write may have taken effect at any time after its call, or never.
+// pending write may have taken effect at any time after its call, or never,
+// and its result (Found, for a delete) is ignored.
 const Pending = math.MaxInt64
 
 func (o Op) String() string {
@@ -72,7 +85,7 @@ func (s register) apply(o Op) (register, bool) {
 	case Put:
 		return register{o.Value, true}, true
 	case Delete:
-		return register{}, o.Found == s.present
+		return register{}, o.Return == Pending || o.Found == s.present
 	default:
 		return s, o.Found == s.present && (!o.Found || o.Value == s.value)
 	}
@@ -96,6 +109,55 @@ func Check(history []Op) (ok bool, bad []Op) {
 		}
 	}
 	return true, nil
+}
+
+// FirstViolation narrows down a history that is not linearizable. It
+// returns the earliest time t such that the history as it stood at t is not
+// linearizable: the operations called by t, with those that had not
+// returned by t treated as pending. The operation that returned at t is the
+// first whose result cannot be explained. found is false if the whole
+// history is linearizable.
+//
+// This works because linearizability is prefix-closed: if the history at t
+// has no valid order, neither does any later one, so t can be found by
+// binary search.
+func FirstViolation(history []Op) (t int64, found bool) {
+	if ok, _ := Check(history); ok {
+		return 0, false
+	}
+	var times []int64
+	for _, o := range history {
+		if o.Return != Pending {
+			times = append(times, o.Return)
+		}
+	}
+	slices.Sort(times)
+	times = slices.Compact(times)
+	// The whole history fails, and it equals the history at the last
+	// return time plus pending operations, which constrain nothing more.
+	i, _ := slices.BinarySearchFunc(times, true, func(t int64, _ bool) int {
+		if ok, _ := Check(At(history, t)); ok {
+			return -1
+		}
+		return 1
+	})
+	return times[i], true
+}
+
+// At returns history as it stood at time t: the operations called by t,
+// with those that had not returned by t marked pending.
+func At(history []Op, t int64) []Op {
+	var out []Op
+	for _, o := range history {
+		if o.Call > t {
+			continue
+		}
+		if o.Return > t {
+			o.Return = Pending
+		}
+		out = append(out, o)
+	}
+	return out
 }
 
 // linearizable searches for an order of ops, all on one key, that is

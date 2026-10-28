@@ -32,6 +32,7 @@ func TestCheckerAcceptsAndRejects(t *testing.T) {
 		{"delete reports presence", []Op{put(1, 2, "a"), del(3, 4, true), del(5, 6, false), get(7, 8, "")}, true},
 		{"delete twice reports found twice", []Op{put(1, 2, "a"), del(3, 4, true), del(5, 6, true)}, false},
 		{"lost delete result", []Op{put(1, 2, "a"), del(3, 4, false)}, false},
+		{"pending delete may report anything", []Op{put(1, 2, "a"), del(3, Pending, false), get(5, 6, "")}, true},
 	}
 	for _, tc := range cases {
 		if got := linearizable(tc.ops); got != tc.want {
@@ -48,5 +49,43 @@ func TestCheckerAcceptsAndRejects(t *testing.T) {
 	}
 	if ok, bad := Check(h); ok || bad[0].Key != "y" {
 		t.Fatalf("Check = %v, %v; want key y reported", ok, bad)
+	}
+}
+
+func TestFirstViolation(t *testing.T) {
+	put := func(call, ret int64, v string) Op {
+		return Op{Kind: Put, Key: "k", Value: v, Call: call, Return: ret}
+	}
+	get := func(call, ret int64, v string) Op {
+		return Op{Kind: Get, Key: "k", Value: v, Found: v != "", Call: call, Return: ret}
+	}
+	ok := []Op{put(1, 2, "a"), get(3, 4, "a"), put(5, 6, "b")}
+	if _, found := FirstViolation(ok); found {
+		t.Fatal("found a violation in a linearizable history")
+	}
+	// The stale read returning at 12 is the first violation. The one at 20
+	// is another, and the read overlapping the write at 7-9 is fine.
+	h := []Op{
+		put(1, 2, "a"),
+		put(3, 9, "b"),
+		get(7, 8, "a"),
+		get(10, 12, "a"),
+		get(11, 13, "b"),
+		get(19, 20, "a"),
+	}
+	if got, found := FirstViolation(h); !found || got != 12 {
+		t.Fatalf("FirstViolation = %d, %v; want 12", got, found)
+	}
+	// The history at 12 does fail, and the one just before it does not.
+	if ok, _ := Check(At(h, 12)); ok {
+		t.Fatal("history at 12 is linearizable")
+	}
+	if ok, _ := Check(At(h, 11)); !ok {
+		t.Fatal("history at 11 is not linearizable")
+	}
+	// Operations still running at t are pending: the write called at 3 and
+	// returning at 9 may or may not have happened by 8.
+	if got := At(h, 8); len(got) != 3 || got[1].Return != Pending || got[2].Return != 8 {
+		t.Fatalf("At(8) = %v", got)
 	}
 }
