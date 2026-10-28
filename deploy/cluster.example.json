@@ -1,0 +1,12 @@
+{
+  "nodes": [
+    {"id": 1, "raft": "10.0.0.1:7001", "api": "10.0.0.1:8001"},
+    {"id": 2, "raft": "10.0.0.2:7001", "api": "10.0.0.2:8001"},
+    {"id": 3, "raft": "10.0.0.3:7001", "api": "10.0.0.3:8001"}
+  ],
+  "tick": "50ms",
+  "election_tick": 10,
+  "heartbeat_tick": 2,
+  "request_timeout": "3s",
+  "snapshot_every": 10000
+}

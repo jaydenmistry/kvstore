@@ -93,3 +93,9 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("Load of an invalid file: err = %v, want one naming the file", err)
 	}
 }
+
+func TestExampleFileIsValid(t *testing.T) {
+	if _, err := Load("../../deploy/cluster.example.json"); err != nil {
+		t.Fatal(err)
+	}
+}

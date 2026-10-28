@@ -1,0 +1,52 @@
+# systemd unit for one kvstore node.
+#
+# Install on each host:
+#   - the binary at /usr/local/bin/kvserver
+#   - the cluster file at /etc/kvstore/cluster.json, the same on every host
+#     (see cluster.example.json)
+#   - this host's node ID in /etc/kvstore/kvserver.env, as KVSTORE_ID=1
+#   - a kvstore system user: useradd --system --no-create-home kvstore
+# then: systemctl enable --now kvserver
+#
+# Exit status 3 means storage failed, most likely a failed fsync. The page
+# cache may then hold writes that never reached disk, and a restarted node
+# could read them back and act on them. systemd must not restart it. Before
+# starting it again by hand, drop the host's page cache
+# (echo 3 > /proc/sys/vm/drop_caches) or reboot the host, then run
+# systemctl reset-failed kvserver && systemctl start kvserver.
+# Exit status 2 is a usage or configuration error, which a restart cannot fix
+# either.
+
+[Unit]
+Description=kvstore node
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=kvstore
+Group=kvstore
+EnvironmentFile=/etc/kvstore/kvserver.env
+ExecStart=/usr/local/bin/kvserver -config /etc/kvstore/cluster.json -id ${KVSTORE_ID} -data /var/lib/kvstore
+StateDirectory=kvstore
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=2s
+RestartPreventExitStatus=2 3
+
+# kvserver exits 0 on SIGTERM after closing its log.
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
