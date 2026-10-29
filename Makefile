@@ -3,7 +3,7 @@ BIN ?= bin
 STATICCHECK_VERSION ?= v0.8.2
 FUZZTIME ?= 30s
 
-.PHONY: all build test race vet fmtcheck staticcheck lint check fuzz clean
+.PHONY: all build test race vet fmtcheck staticcheck lint check fuzz chaos clean
 
 all: lint race build
 
@@ -36,6 +36,11 @@ fuzz:
 	$(GO) test ./internal/wal -run='^$$' -fuzz=FuzzDecodeAll -fuzztime=$(FUZZTIME)
 	$(GO) test ./internal/kv -run='^$$' -fuzz=FuzzDecodeCommand -fuzztime=$(FUZZTIME)
 	$(GO) test ./internal/kv -run='^$$' -fuzz=FuzzRestore -fuzztime=$(FUZZTIME)
+
+# Real processes under faults, checked for linearizability; see cmd/kvchaos.
+# Not part of check: it takes a minute and depends on real timing.
+chaos:
+	scripts/chaos.sh $(CHAOS_ARGS)
 
 clean:
 	rm -rf $(BIN)
