@@ -30,6 +30,7 @@ Module: `github.com/jaydenmistry/kvstore`. Go 1.27, Linux.
 ```
 cmd/kvserver/        node binary
 cmd/kvctl/           CLI client
+cmd/kvchaos/         real-process chaos test: link proxies, faults, linearizability check
 internal/vfs/        filesystem interface: OS implementation + crash-simulating in-memory FS
 internal/wal/        append-only log; one CRC32C frame per Append (crash-atomic batch); Raft-agnostic
 internal/raft/       consensus core; defines the Transport and Storage interfaces it consumes
@@ -37,6 +38,9 @@ internal/transport/  in-memory deterministic transport for tests; TCP transport 
 internal/kv/         state machine, client dedup table, Replica (requests <-> Raft); no I/O
 internal/server/     one node: wall-clock loop owning the Replica, TCP peers, HTTP client API
 internal/client/     Go client: leader redirects, retries with the same sequence number
+internal/config/     cluster configuration file (JSON), shared by kvserver and kvctl
+internal/linearize/  linearizability checker (Wing-Gong with Lowe's memoization), per key
+deploy/              systemd unit, example cluster file
 scripts/             local cluster and chaos scripts
 ```
 
@@ -65,6 +69,13 @@ Create packages only when the phase that needs them begins.
   steps down, staying in its term. It is a liveness aid, not a lease: reads
   still need the ReadIndex round. kvserver always enables it; tests run with
   it on and off, so safety is never shown only with it on.
+- PreVote (thesis §9.6): before raising its term, a node asks whether a
+  majority would vote for it. MsgPreVote and a granted MsgPreVoteResp carry
+  the proposed term and must not be adopted (the one exception to §5.1); a
+  refusal carries the voter's term. Refusing because a leader was heard
+  recently (stickiness) applies only with CheckQuorum: without it, a one-way
+  partition can deadlock the cluster (see `inLeaderLease`). Same on/off rule
+  as CheckQuorum.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
@@ -109,6 +120,12 @@ Create packages only when the phase that needs them begins.
   check the whole history with a linearizability checker, per key.
 - Tests over real sockets (TCP transport, server end to end) cannot avoid real
   time. They poll with generous deadlines and never sleep for a fixed time.
+- `make chaos` (cmd/kvchaos) runs real kvserver processes with Raft traffic
+  through per-direction proxies, kills, pauses, and partitions them (including
+  partitioning the leader), then checks the history for linearizability and
+  that nodes converge. It is not deterministic and not part of `make check`.
+  Half its clients use `client.Spread`, or stale leaders are never queried.
+  Plant bugs by building a mutated kvserver and passing it with `-kvserver`.
 - When adding a safety test, plant the bug it targets in a scratch copy and confirm
   the test fails. A test that passes on broken code is not testing anything.
 
@@ -135,5 +152,6 @@ Create packages only when the phase that needs them begins.
 
 ## Commands
 
-`make build | test | race | vet | fmtcheck | staticcheck | lint | check | fuzz | clean`.
+`make build | test | race | vet | fmtcheck | staticcheck | lint | check | fuzz | chaos | clean`.
+`scripts/cluster.sh start|stop|status|kill N|pause N|...` runs a local three-node cluster.
 `staticcheck` runs a pinned version through `go run`, which keeps it out of go.mod.
