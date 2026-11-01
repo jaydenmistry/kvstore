@@ -148,28 +148,46 @@ func (c *cluster) failure() error {
 	return c.failed
 }
 
-func freeAddr() (string, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", err
+// freeAddrs returns n distinct free addresses for kvserver to listen on.
+//
+// They are below 32768, where Linux starts the ephemeral ports it gives
+// outgoing connections and listeners on port 0 (the proxies'). A port from
+// that range could be taken by one of those between being chosen here and
+// kvserver binding it, as could a port this function had released while
+// still choosing, so every port stays held until all are chosen.
+func freeAddrs(n int) ([]string, error) {
+	var lns []net.Listener
+	defer func() {
+		for _, ln := range lns {
+			ln.Close()
+		}
+	}()
+	for tries := 0; len(lns) < n; tries++ {
+		if tries == 100*n {
+			return nil, errors.New("no free ports below 32768")
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", 20000+rand.IntN(12768)))
+		if err == nil {
+			lns = append(lns, ln)
+		}
 	}
-	defer ln.Close()
-	return ln.Addr().String(), nil
+	addrs := make([]string, n)
+	for i, ln := range lns {
+		addrs[i] = ln.Addr().String()
+	}
+	return addrs, nil
 }
 
 func newCluster(o options) (*cluster, error) {
 	c := &cluster{links: map[[2]uint64]*link{}}
+	addrs, err := freeAddrs(2 * o.nodes)
+	if err != nil {
+		return nil, err
+	}
 	raftAddr := map[uint64]string{}
 	apiAddr := map[uint64]string{}
 	for i := 1; i <= o.nodes; i++ {
-		id := uint64(i)
-		var err error
-		if raftAddr[id], err = freeAddr(); err != nil {
-			return nil, err
-		}
-		if apiAddr[id], err = freeAddr(); err != nil {
-			return nil, err
-		}
+		raftAddr[uint64(i)], apiAddr[uint64(i)] = addrs[2*i-2], addrs[2*i-1]
 	}
 	for from := range raftAddr {
 		for to := range raftAddr {
