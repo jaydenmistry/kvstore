@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jaydenmistry/kvstore/internal/client"
@@ -32,26 +33,45 @@ func (r *recorder) add(o linearize.Op) {
 // runClient issues random operations one at a time until stop is closed.
 // Each operation runs until it has an outcome: the client retries with the
 // same sequence number across leader changes and node failures, so a
-// write is never abandoned with its outcome unknown. If ctx ends first,
-// the operation is recorded as pending, and the run fails for having left
+// write is not abandoned with its outcome unknown. The exception is a write
+// refused because the client's session was evicted, which is recorded as
+// pending: it may or may not have been applied. If ctx ends first, the
+// operation is recorded as pending too, and the run fails for having left
 // it unfinished.
-func runClient(ctx context.Context, stop <-chan struct{}, rec *recorder, servers []string, keys []string, seed uint64, n int) error {
-	c, err := client.New(servers)
+func runClient(ctx context.Context, stop <-chan struct{}, rec *recorder, servers []string, keys []string, seed uint64, n int, expired *atomic.Int64) error {
+	newClient := func() (*client.Client, error) {
+		c, err := client.New(servers)
+		if err != nil {
+			return nil, err
+		}
+		// Short attempts, so a client stuck on a paused node moves on
+		// quickly.
+		c.AttemptTimeout = time.Second
+		// Half the clients send each request to a random node. Clients
+		// that stick to the leader leave a deposed leader as soon as a
+		// write stalls there, and rarely come back while it is stale.
+		c.Spread = n%2 == 1
+		return c, nil
+	}
+	c, err := newClient()
 	if err != nil {
 		return err
 	}
-	// Short attempts, so a client stuck on a paused node moves on quickly.
-	c.AttemptTimeout = time.Second
-	// Half the clients send each request to a random node. Clients that
-	// stick to the leader leave a deposed leader as soon as a write stalls
-	// there, and rarely come back while it is stale.
-	c.Spread = n%2 == 1
 	rng := rand.New(rand.NewPCG(seed, uint64(n)))
 	for i := 0; ; i++ {
 		select {
 		case <-stop:
 			return nil
 		default:
+		}
+		// Now and then the client is replaced by a new one, as clients come
+		// and go, and registers a new session. With fewer sessions than
+		// clients, the registrations keep evicting sessions that are
+		// still in use, sometimes while a write in them is being retried.
+		if rng.IntN(100) == 0 {
+			if c, err = newClient(); err != nil {
+				return err
+			}
 		}
 		key := keys[rng.IntN(len(keys))]
 		o := linearize.Op{Client: uint64(n), Key: key, Call: rec.now()}
@@ -67,6 +87,12 @@ func runClient(ctx context.Context, stop <-chan struct{}, rec *recorder, servers
 		default:
 			o.Kind = linearize.Delete
 			o.Found, err = c.Delete(ctx, key)
+		}
+		if errors.Is(err, client.ErrSessionExpired) {
+			o.Return = linearize.Pending
+			rec.add(o)
+			expired.Add(1)
+			continue
 		}
 		if err != nil {
 			var definite *client.Error

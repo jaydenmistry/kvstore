@@ -40,8 +40,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/jaydenmistry/kvstore/internal/kv"
 	"github.com/jaydenmistry/kvstore/internal/linearize"
 	"github.com/jaydenmistry/kvstore/internal/server"
 )
@@ -62,6 +64,8 @@ type options struct {
 	// checkQuorum and preVote are "on", "off", or "random" (chosen from
 	// the seed).
 	checkQuorum, preVote string
+	// maxSessions is passed to the nodes; 0 picks from the seed.
+	maxSessions int
 }
 
 func run() int {
@@ -78,6 +82,7 @@ func run() int {
 	flag.IntVar(&o.snapshotEvery, "snapshot-every", 50, "nodes compact their logs after this many applied `entries`")
 	flag.StringVar(&o.checkQuorum, "check-quorum", "random", "run nodes with CheckQuorum `on`, off, or random")
 	flag.StringVar(&o.preVote, "pre-vote", "random", "run nodes with PreVote `on`, off, or random")
+	flag.IntVar(&o.maxSessions, "max-sessions", 0, "client `sessions` the nodes keep (default: from the seed, either the default or fewer than -clients)")
 	flag.Parse()
 	valid := func(s string) bool { return s == "on" || s == "off" || s == "random" }
 	if flag.NArg() > 0 || o.nodes < 1 || o.clients < 1 || o.keys < 1 || !valid(o.checkQuorum) || !valid(o.preVote) {
@@ -96,6 +101,11 @@ func run() int {
 			*s = []string{"on", "off"}[rng.IntN(2)]
 		}
 	}
+	// Fewer sessions than clients makes sessions expire while their
+	// clients still use them.
+	if o.maxSessions == 0 {
+		o.maxSessions = []int{int(kv.DefaultMaxSessions), max(1, o.clients-3)}[rng.IntN(2)]
+	}
 	if _, err := os.Stat(o.bin); err != nil {
 		log.Printf("kvserver binary: %v (build it with make build)", err)
 		return 2
@@ -109,8 +119,8 @@ func run() int {
 		o.dir = d
 	}
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	log.Printf("seed %d, %d nodes, %d clients, %v of faults, CheckQuorum %s, PreVote %s, directory %s",
-		o.seed, o.nodes, o.clients, o.duration, o.checkQuorum, o.preVote, o.dir)
+	log.Printf("seed %d, %d nodes, %d clients, %v of faults, CheckQuorum %s, PreVote %s, %d sessions, directory %s",
+		o.seed, o.nodes, o.clients, o.duration, o.checkQuorum, o.preVote, o.maxSessions, o.dir)
 
 	err := chaos(o)
 	if err != nil {
@@ -209,6 +219,7 @@ func newCluster(o options) (*cluster, error) {
 			"-snapshot-every", fmt.Sprint(o.snapshotEvery),
 			"-check-quorum=" + fmt.Sprint(o.checkQuorum == "on"),
 			"-pre-vote=" + fmt.Sprint(o.preVote == "on"),
+			"-max-sessions", fmt.Sprint(o.maxSessions),
 		}
 		// Each node reaches every peer through the link from it to that
 		// peer, so its peer list differs from the others' in the Raft
@@ -496,12 +507,13 @@ func chaos(o options) error {
 	rec := &recorder{start: time.Now()}
 	stop := make(chan struct{})
 	errs := make(chan error, o.clients)
+	var expired atomic.Int64
 	keys := make([]string, o.keys)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("k%d", i)
 	}
 	for i := range o.clients {
-		go func() { errs <- runClient(ctx, stop, rec, c.servers(), keys, o.seed, i) }()
+		go func() { errs <- runClient(ctx, stop, rec, c.servers(), keys, o.seed, i, &expired) }()
 	}
 
 	rng := rand.New(rand.NewPCG(o.seed, 0))
@@ -557,13 +569,16 @@ func chaos(o options) error {
 
 	var reads, writes int
 	for _, op := range ops {
-		if op.Kind == linearize.Get {
+		switch {
+		case op.Return == linearize.Pending:
+		case op.Kind == linearize.Get:
 			reads++
-		} else {
+		default:
 			writes++
 		}
 	}
-	log.Printf("checking %d operations (%d reads, %d writes) for linearizability", len(ops), reads, writes)
+	log.Printf("checking %d operations (%d reads, %d writes, %d writes refused after their session expired) for linearizability",
+		len(ops), reads, writes, expired.Load())
 	start := time.Now()
 	if ok, bad := linearize.Check(ops); !ok {
 		return explain(o.dir, bad)
