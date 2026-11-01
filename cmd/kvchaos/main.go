@@ -588,21 +588,37 @@ func chaos(o options) error {
 }
 
 // explain reports a key whose history is not linearizable, narrowed down to
-// the first operation whose result cannot be explained, and writes the
-// operations leading up to it to violation.txt.
+// the first operation whose result cannot be explained, and writes that
+// operation and the ones around it to violation.txt.
 func explain(dir string, bad []linearize.Op) error {
 	t, _ := linearize.FirstViolation(bad)
-	at := linearize.At(bad, t)
-	slices.SortFunc(at, func(a, b linearize.Op) int { return cmp.Compare(a.Call, b.Call) })
 	var culprit linearize.Op
-	var b strings.Builder
-	fmt.Fprintf(&b, "The history of key %q is not linearizable. The operations called\n", bad[0].Key)
-	fmt.Fprintf(&b, "by %d ns have no valid order; those called last are below, and the\n", t)
-	fmt.Fprintf(&b, "operation marked <- returned at that time. Times are ns since the start.\n\n")
-	for _, o := range at[max(0, len(at)-40):] {
-		mark := ""
+	for _, o := range bad {
 		if o.Return == t {
-			culprit, mark = o, "  <-"
+			culprit = o
+		}
+	}
+	// The operations that overlap the culprit, or ended up to 100 ms
+	// before it was called, are the ones its result depends on. Reads still
+	// running at t constrain nothing and are left out.
+	from := culprit.Call - (100 * time.Millisecond).Nanoseconds()
+	var near []linearize.Op
+	for _, o := range linearize.At(bad, t) {
+		if o.Return >= from && !(o.Kind == linearize.Get && o.Return == linearize.Pending) {
+			near = append(near, o)
+		}
+	}
+	slices.SortFunc(near, func(a, b linearize.Op) int { return cmp.Compare(a.Call, b.Call) })
+	var b strings.Builder
+	fmt.Fprintf(&b, "The history of key %q is not linearizable. The operations called by\n", bad[0].Key)
+	fmt.Fprintf(&b, "%d ns, with those still running then taken as pending, have no valid\n", t)
+	fmt.Fprintf(&b, "order. Below are those near the operation marked <-, which returned at\n")
+	fmt.Fprintf(&b, "that time and is the first whose result cannot be explained. Times are\n")
+	fmt.Fprintf(&b, "ns since the start; ? marks an operation still running.\n\n")
+	for _, o := range near {
+		mark := ""
+		if o == culprit {
+			mark = "  <-"
 		}
 		fmt.Fprintf(&b, "%v%s\n", o, mark)
 	}
