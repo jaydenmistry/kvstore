@@ -48,6 +48,9 @@ type Config struct {
 	// SnapshotEvery is how many applied entries trigger a snapshot and log
 	// compaction. Zero means DefaultSnapshotEvery; negative disables it.
 	SnapshotEvery int
+	// MaxSessions is how many client sessions the cluster keeps; see
+	// kv.Config. Zero means kv.DefaultMaxSessions.
+	MaxSessions uint64
 	// DisableCheckQuorum and DisablePreVote turn off those Raft options,
 	// which are on by default. Neither affects safety, so tests turn them
 	// off to show that; leave them on otherwise.
@@ -154,7 +157,11 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		log:     log,
 		storage: storage,
 		tr:      tr,
-		replica: kv.NewReplica(r, kv.Config{RequestTimeout: timeoutTicks, SnapshotEvery: uint64(max(0, cfg.SnapshotEvery))}),
+		replica: kv.NewReplica(r, kv.Config{
+			RequestTimeout: timeoutTicks,
+			SnapshotEvery:  uint64(max(0, cfg.SnapshotEvery)),
+			MaxSessions:    cfg.MaxSessions,
+		}),
 		apiLn:   apiLn,
 		ops:     make(chan func() error),
 		stopped: make(chan struct{}),
@@ -269,6 +276,7 @@ type Status struct {
 	Applied   uint64 `json:"applied"`
 	LastIndex uint64 `json:"last_index"`
 	Snapshot  uint64 `json:"snapshot"`
+	Sessions  int    `json:"sessions"`
 }
 
 func (s *Server) status(ctx context.Context) (Status, error) {
@@ -278,6 +286,7 @@ func (s *Server) status(ctx context.Context) (Status, error) {
 		st = Status{
 			ID: rs.ID, State: rs.State.String(), Term: rs.Term, Leader: rs.Lead,
 			Commit: rs.Commit, Applied: s.replica.Applied(), LastIndex: rs.LastIndex, Snapshot: rs.Snapshot,
+			Sessions: s.replica.Sessions(),
 		}
 	})
 	return st, err

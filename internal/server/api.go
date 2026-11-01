@@ -17,11 +17,15 @@ import (
 //	GET    /kv/{key}  200 with the value, or 404
 //	PUT    /kv/{key}  body is the value; 204
 //	DELETE /kv/{key}  204 if the key existed, 404 if not
+//	POST   /session   200 with a new client ID, in decimal
 //	GET    /status    this node's Raft state, as JSON
 //
 // The key is one path segment, percent-escaped (including "/" and ".").
-// Writes must carry the headers Kv-Client-Id and Kv-Seq: a nonzero client ID
-// and that client's sequence number for this write, reused on every retry.
+// Writes must carry the headers Kv-Client-Id and Kv-Seq: a client ID from
+// POST /session and that client's sequence number for this write, starting
+// at 1 and reused on every retry. A write answered 410 Gone was refused
+// because the client's session was evicted; its outcome is unknown, and the
+// client must register again.
 //
 // A node that is not the leader answers 307 Temporary Redirect to the
 // leader's API, or 503 if it knows no leader. 503 also means the request's
@@ -39,8 +43,25 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /kv/{key...}", s.handleKV)
 	mux.HandleFunc("PUT /kv/{key...}", s.handleKV)
 	mux.HandleFunc("DELETE /kv/{key...}", s.handleKV)
+	mux.HandleFunc("POST /session", s.handleRegister)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	return mux
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	res, err := s.submit(r.Context(), kv.Request{Op: kv.OpRegister})
+	switch {
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	case errors.Is(res.Err, kv.ErrNotLeader):
+		s.redirect(w, r, res.Leader)
+	case res.Err != nil: // ErrTimeout, ErrLeadershipLost
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, res.Err.Error(), http.StatusServiceUnavailable)
+	default:
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintln(w, res.ClientID)
+	}
 }
 
 func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +105,8 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, res.Err.Error(), http.StatusBadRequest)
 	case errors.Is(res.Err, kv.ErrStaleSequence):
 		http.Error(w, res.Err.Error(), http.StatusConflict)
+	case errors.Is(res.Err, kv.ErrSessionExpired):
+		http.Error(w, res.Err.Error(), http.StatusGone)
 	case res.Err != nil: // ErrTimeout, ErrLeadershipLost
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, res.Err.Error(), http.StatusServiceUnavailable)

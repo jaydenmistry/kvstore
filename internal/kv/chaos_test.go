@@ -15,25 +15,32 @@ import (
 // time, retrying until it learns the outcome. It follows leader hints, and
 // after a timeout or lost leadership it tries another node. A retried write
 // keeps its sequence number, so the cluster can detect the duplicate.
+//
+// It registers a session before its first operation. If the session is
+// evicted, the write in progress has an unknown outcome and is recorded as
+// pending, and the client registers again.
 type simClient struct {
-	c   *cluster
-	h   *history
-	rng *rand.Rand
-	id  uint64
-	seq uint64
+	c    *cluster
+	h    *history
+	rng  *rand.Rand
+	name uint64 // for the history
+	id   uint64 // session; 0 until registered
+	seq  uint64
 
-	cur      *linearize.Op // the operation in progress, nil when idle
-	req      Request
-	target   uint64 // node to send the next attempt to; 0 for any
-	attempt  int    // incremented per attempt; older callbacks are ignored
-	waiting  bool
-	deadline int // tick at which to give up on the current attempt
+	registering bool
+	cur         *linearize.Op // the operation in progress, nil when idle
+	req         Request
+	target      uint64 // node to send the next attempt to; 0 for any
+	attempt     int    // incremented per attempt; older callbacks are ignored
+	waiting     bool
+	deadline    int // tick at which to give up on the current attempt
 }
 
 // history numbers events so operations can be ordered in real time.
 type history struct {
-	events int64
-	ops    []linearize.Op
+	events  int64
+	ops     []linearize.Op
+	expired int // writes refused because their session was evicted
 }
 
 func (h *history) event() int64 {
@@ -51,12 +58,17 @@ var keys = []string{"a", "b", "c"}
 // begin a new operation.
 func (cl *simClient) step(start bool) {
 	c := cl.c
-	if cl.cur == nil {
+	if cl.cur == nil && !cl.registering {
 		if !start || cl.rng.IntN(3) != 0 {
 			return
 		}
+		if cl.id == 0 {
+			cl.registering, cl.req, cl.waiting = true, Request{Op: OpRegister}, false
+		}
+	}
+	if cl.cur == nil && !cl.registering {
 		key := keys[cl.rng.IntN(len(keys))]
-		cl.cur = &linearize.Op{Client: cl.id, Key: key, Call: cl.h.event()}
+		cl.cur = &linearize.Op{Client: cl.name, Key: key, Call: cl.h.event()}
 		switch p := cl.rng.IntN(100); {
 		case p < 50:
 			cl.cur.Kind = linearize.Get
@@ -106,6 +118,15 @@ func (cl *simClient) step(start bool) {
 
 func (cl *simClient) handle(res Result) {
 	switch {
+	case cl.registering && res.Err == nil:
+		cl.id, cl.seq = res.ClientID, 0
+		cl.registering, cl.waiting = false, false
+	case errors.Is(res.Err, ErrSessionExpired):
+		o := cl.cur
+		o.Return = linearize.Pending
+		cl.h.ops = append(cl.h.ops, *o)
+		cl.cur, cl.waiting, cl.id = nil, false, 0
+		cl.h.expired++
 	case res.Err == nil:
 		o := cl.cur
 		o.Return = cl.h.event()
@@ -134,9 +155,16 @@ func TestLinearizableUnderChaos(t *testing.T) {
 	// every operation completes. The full history, with real-time order,
 	// must be linearizable, and the replicas' state machines identical.
 	const seeds = 100
-	var completed, writes, reads int
+	var writes, reads, expired int
 	for seed := range uint64(seeds) {
-		c := newCluster(t, 5, seed, seed%2 == 1, withCheckQuorum(seed/4%2 == 1), withPreVote(seed/8%2 == 1))
+		// A quarter of the runs keep fewer sessions than there are
+		// clients, so sessions are evicted while their clients retry.
+		maxSessions := uint64(0)
+		if seed%4 == 3 {
+			maxSessions = 3
+		}
+		c := newCluster(t, 5, seed, seed%2 == 1, withCheckQuorum(seed/4%2 == 1), withPreVote(seed/8%2 == 1),
+			withMaxSessions(maxSessions))
 		// A third of the runs never compact, a third compact often.
 		c.setSnapshotEvery([]uint64{0, 5, 50}[seed%3])
 		rng := rand.New(rand.NewPCG(seed, 4))
@@ -146,7 +174,7 @@ func TestLinearizableUnderChaos(t *testing.T) {
 		h := &history{}
 		var clients []*simClient
 		for i := range 5 {
-			clients = append(clients, &simClient{c: c, h: h, rng: rand.New(rand.NewPCG(seed, uint64(10+i))), id: uint64(i + 1)})
+			clients = append(clients, &simClient{c: c, h: h, rng: rand.New(rand.NewPCG(seed, uint64(10+i))), name: uint64(i + 1)})
 		}
 
 		for range 1500 {
@@ -187,7 +215,7 @@ func TestLinearizableUnderChaos(t *testing.T) {
 			idle := true
 			for _, cl := range clients {
 				cl.step(false)
-				idle = idle && cl.cur == nil
+				idle = idle && cl.cur == nil && !cl.registering
 			}
 			if idle {
 				break
@@ -209,17 +237,24 @@ func TestLinearizableUnderChaos(t *testing.T) {
 		c.waitApplied(c.nodes[lead].sm.Applied(), 20*electionTick)
 		c.checkReplicasAgree()
 
-		completed += len(h.ops)
 		for _, o := range h.ops {
-			if o.Kind == linearize.Get {
+			switch {
+			case o.Return == linearize.Pending:
+			case o.Kind == linearize.Get:
 				reads++
-			} else {
+			default:
 				writes++
 			}
 		}
+		expired += h.expired
 	}
-	t.Logf("%d operations (%d reads, %d writes) across %d runs", completed, reads, writes, seeds)
+	completed := reads + writes
+	t.Logf("%d operations (%d reads, %d writes) across %d runs; %d writes refused after their session was evicted",
+		completed, reads, writes, seeds, expired)
 	if completed < seeds*100 {
 		t.Fatalf("only %d operations completed across %d runs; chaos too severe to test much", completed, seeds)
+	}
+	if expired == 0 {
+		t.Fatal("no session was evicted while its client was retrying; eviction is untested")
 	}
 }

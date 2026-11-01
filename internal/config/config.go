@@ -11,7 +11,8 @@
 //	  "election_tick": 10,
 //	  "heartbeat_tick": 2,
 //	  "request_timeout": "3s",
-//	  "snapshot_every": 10000
+//	  "snapshot_every": 10000,
+//	  "max_sessions": 10000
 //	}
 //
 // Every node must be given the same file. Fields other than nodes are
@@ -48,6 +49,9 @@ type Cluster struct {
 	// SnapshotEvery is server.Config.SnapshotEvery: zero means the
 	// default, negative disables snapshots.
 	SnapshotEvery int `json:"snapshot_every"`
+	// MaxSessions is server.Config.MaxSessions: how many client sessions
+	// the cluster keeps. Zero means the default.
+	MaxSessions uint64 `json:"max_sessions"`
 }
 
 // Node is one cluster member.

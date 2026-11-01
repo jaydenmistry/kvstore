@@ -16,6 +16,14 @@ import (
 // kept.
 var ErrStaleSequence = errors.New("kv: sequence number already superseded")
 
+// ErrSessionExpired is the result of a write from a client the state
+// machine has no session for: one evicted to make room for newer sessions,
+// or never registered. The write is not applied. An earlier attempt of the
+// same write may have been, before the session was evicted, so its outcome
+// is unknown; the client must not retry it under a new session as if it
+// had failed.
+var ErrSessionExpired = errors.New("kv: client session expired; outcome unknown")
+
 // Result is the outcome of a request.
 type Result struct {
 	// Value is the value read by a Get. It must not be modified.
@@ -29,13 +37,17 @@ type Result struct {
 	// Leader is, with ErrNotLeader, the leader this node knows of, or
 	// raft.None.
 	Leader uint64
+	// ClientID is the new client ID, for OpRegister.
+	ClientID uint64
 }
 
 // session is what the state machine remembers about one client: its latest
-// applied write and that write's result.
+// applied write, that write's result, and the index of the last entry from
+// it, which decides which session is evicted first.
 type session struct {
-	seq    uint64
-	result Result
+	seq      uint64
+	result   Result
+	lastUsed uint64
 }
 
 // StateMachine is the key-value map plus the client sessions used for
@@ -82,6 +94,9 @@ func (s *StateMachine) Apply(e raft.Entry) (Result, error) {
 		return Result{}, fmt.Errorf("kv: committed entry %d: %w", e.Index, err)
 	}
 	s.applied = e.Index
+	if c.Op == OpRegister {
+		return s.register(e.Index, c.MaxSessions), nil
+	}
 
 	// Duplicate detection (§8). A client retries a write whose outcome it
 	// never learned, so the same (client, seq) can be committed twice: say
@@ -90,7 +105,17 @@ func (s *StateMachine) Apply(e raft.Entry) (Result, error) {
 	// retried Put could overwrite a later write by the same client. It must
 	// also return the first copy's result rather than a fresh one: a
 	// retried Delete would otherwise report that the key was not found.
-	sess := s.sessions[c.ClientID]
+	//
+	// Without the client's session, a duplicate cannot be recognized, so
+	// the write is refused rather than risk applying it twice. Every
+	// session starts with a register entry, so a client ID with no session
+	// is one that was evicted (or never existed): never a new client.
+	sess, ok := s.sessions[c.ClientID]
+	if !ok {
+		return Result{Err: ErrSessionExpired}, nil
+	}
+	sess.lastUsed = e.Index
+	s.sessions[c.ClientID] = sess
 	switch {
 	case c.Seq == sess.seq:
 		return sess.result, nil
@@ -106,20 +131,51 @@ func (s *StateMachine) Apply(e raft.Entry) (Result, error) {
 		_, res.Found = s.data[c.Key]
 		delete(s.data, c.Key)
 	}
-	s.sessions[c.ClientID] = session{seq: c.Seq, result: res}
+	s.sessions[c.ClientID] = session{seq: c.Seq, result: res, lastUsed: e.Index}
 	return res, nil
+}
+
+// register opens a session whose client ID is index (thesis §6.3), first
+// evicting the least recently used sessions until there is room for it
+// within max. Every replica applies the same entries in the same order, so
+// all of them evict the same sessions.
+//
+// Eviction scans every session, which is fine for registrations, which
+// are rare next to reads and writes. A client that registers far more often
+// would need an ordered index.
+func (s *StateMachine) register(index, max uint64) Result {
+	for uint64(len(s.sessions)) >= max {
+		// Each entry touches one session, so lastUsed values are distinct,
+		// except for sessions restored from a version 1 snapshot, which
+		// all have 0. Breaking ties by client ID keeps the choice
+		// independent of Go's random map order.
+		var oldest uint64
+		first := true
+		for c, sess := range s.sessions {
+			o := s.sessions[oldest]
+			if first || sess.lastUsed < o.lastUsed || (sess.lastUsed == o.lastUsed && c < oldest) {
+				oldest, first = c, false
+			}
+		}
+		delete(s.sessions, oldest)
+	}
+	s.sessions[index] = session{lastUsed: index}
+	return Result{ClientID: index}
 }
 
 // Snapshot encoding, with integers big-endian and keys and clients in
 // sorted order, so equal states encode to equal bytes:
 //
-//	| version u8 = 1 |
+//	| version u8 = 2 |
 //	| key count u64 | (key length u32 | key | value length u32 | value)... |
-//	| session count u64 | (client u64 | seq u64 | found u8)... |
+//	| session count u64 | (client u64 | seq u64 | found u8 | last used u64)... |
 //
 // The sessions are part of the replicated state. A node restored without
-// them would apply a retried write a second time.
-const snapshotVersion = 1
+// them would apply a retried write a second time, and one restored without
+// their last-used indexes would evict different sessions from the other
+// replicas. Version 1 lacks the indexes; its sessions restore as least
+// recently used.
+const snapshotVersion = 2
 
 // Snapshot serializes the state machine: the data and the client sessions.
 // It describes the state after Applied.
@@ -143,6 +199,7 @@ func (s *StateMachine) Snapshot() []byte {
 			found = 1
 		}
 		b = append(b, found)
+		b = binary.BigEndian.AppendUint64(b, sess.lastUsed)
 	}
 	return b
 }
@@ -152,8 +209,9 @@ func (s *StateMachine) Snapshot() []byte {
 // shares.
 func (s *StateMachine) Restore(snap raft.Snapshot) error {
 	d := decoder{b: snap.Data}
-	if v := d.byte(); v != snapshotVersion {
-		return fmt.Errorf("kv: snapshot at %d has version %d", snap.Index, v)
+	version := d.byte()
+	if version != 1 && version != snapshotVersion {
+		return fmt.Errorf("kv: snapshot at %d has version %d", snap.Index, version)
 	}
 	data := map[string][]byte{}
 	for n := d.uint64(); n > 0 && d.err == nil; n-- {
@@ -167,7 +225,11 @@ func (s *StateMachine) Restore(snap raft.Snapshot) error {
 	sessions := map[uint64]session{}
 	for n := d.uint64(); n > 0 && d.err == nil; n-- {
 		c, seq := d.uint64(), d.uint64()
-		sessions[c] = session{seq: seq, result: Result{Found: d.byte() == 1}}
+		sess := session{seq: seq, result: Result{Found: d.byte() == 1}}
+		if version >= 2 {
+			sess.lastUsed = d.uint64()
+		}
+		sessions[c] = sess
 	}
 	if d.err == nil && len(d.b) > 0 {
 		d.err = fmt.Errorf("%d bytes left over", len(d.b))

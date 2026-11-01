@@ -25,11 +25,12 @@ func TestPutGetDeleteThroughLeader(t *testing.T) {
 		if res := c.do(l, getReq("k")); res.Found {
 			t.Fatalf("n=%d: empty store has k = %q", n, res.Value)
 		}
-		c.do(l, putReq(1, 1, "k", "v"))
+		id := c.register(l)
+		c.do(l, putReq(id, 1, "k", "v"))
 		if res := c.do(l, getReq("k")); !res.Found || string(res.Value) != "v" {
 			t.Fatalf("n=%d: Get after Put = %+v", n, res)
 		}
-		if res := c.do(l, deleteReq(1, 2, "k")); !res.Found {
+		if res := c.do(l, deleteReq(id, 2, "k")); !res.Found {
 			t.Fatalf("n=%d: Delete of existing key reported not found", n)
 		}
 		if res := c.do(l, getReq("k")); res.Found {
@@ -73,6 +74,8 @@ func TestInvalidRequests(t *testing.T) {
 		{Op: OpPut, Key: "k", Seq: 1},
 		{Op: OpPut, Key: "k", ClientID: 1},
 		{Op: OpPut, Key: "k", ClientID: 1, Seq: 1, Value: make([]byte, MaxValueSize+1)},
+		{Op: OpRegister, Key: "k"},
+		{Op: OpRegister, ClientID: 1},
 		{Op: 0, Key: "k"},
 	} {
 		if cl := c.submit(l, req); !errors.Is(cl.res.Err, ErrInvalid) {
@@ -90,10 +93,11 @@ func TestDeposedLeaderDoesNotServeStaleRead(t *testing.T) {
 	for seed := range uint64(10) {
 		c := newCluster(t, 5, seed, false)
 		old := c.leader()
-		c.do(old, putReq(1, 1, "k", "old"))
+		id := c.register(old)
+		c.do(old, putReq(id, 1, "k", "old"))
 		c.net.Partition([]uint64{old}, others(c.ids, old))
 		lead := c.leaderAmong(others(c.ids, old), 30*electionTick)
-		c.do(lead, putReq(1, 2, "k", "new"))
+		c.do(lead, putReq(id, 2, "k", "new"))
 
 		if c.nodes[old].raft.Status().State != raft.Leader {
 			c.fatalf("old leader stepped down; the scenario needs it to believe it still leads")
@@ -118,7 +122,7 @@ func TestDeposedLeaderWriteFailsAfterHeal(t *testing.T) {
 		c.net.Partition([]uint64{old}, others(c.ids, old))
 		cl := c.submit(old, putReq(1, 1, "k", "lost"))
 		lead := c.leaderAmong(others(c.ids, old), 30*electionTick)
-		c.do(lead, putReq(2, 1, "k", "kept"))
+		c.do(lead, putReq(c.register(lead), 1, "k", "kept"))
 		c.net.Heal()
 		res := c.wait(cl, 2*requestTimeout)
 		if !errors.Is(res.Err, ErrLeadershipLost) && !errors.Is(res.Err, ErrTimeout) {
@@ -139,21 +143,22 @@ func TestRetryAfterLeaderCrashAppliesOnce(t *testing.T) {
 	for seed := range uint64(10) {
 		c := newCluster(t, 3, seed, seed%2 == 1)
 		l := c.leader()
-		c.do(l, putReq(7, 1, "k", "v"))
-		del := c.submit(l, deleteReq(7, 2, "k"))
+		c7 := c.register(l)
+		c.do(l, putReq(c7, 1, "k", "v"))
+		del := c.submit(l, deleteReq(c7, 2, "k"))
 		c.wait(del, 2*requestTimeout)
 		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
 		c.crash(l) // pretend the reply was lost
 
 		next := c.leaderAmong(others(c.ids, l), 30*electionTick)
-		res := c.do(next, deleteReq(7, 2, "k"))
+		res := c.do(next, deleteReq(c7, 2, "k"))
 		if !res.Found {
 			c.fatalf("retried delete reported not found; the original deleted the key")
 		}
 		// A different client's write in between, then a late duplicate of
-		// client 7's Put: it must not resurrect the key.
-		c.do(next, putReq(8, 1, "other", "x"))
-		if res := c.wait(c.submit(next, putReq(7, 1, "k", "v")), 2*requestTimeout); !errors.Is(res.Err, ErrStaleSequence) {
+		// client c7's Put: it must not resurrect the key.
+		c.do(next, putReq(c.register(next), 1, "other", "x"))
+		if res := c.wait(c.submit(next, putReq(c7, 1, "k", "v")), 2*requestTimeout); !errors.Is(res.Err, ErrStaleSequence) {
 			c.fatalf("late duplicate of seq 1: %+v, want ErrStaleSequence", res)
 		}
 		if res := c.do(next, getReq("k")); res.Found {
@@ -163,17 +168,19 @@ func TestRetryAfterLeaderCrashAppliesOnce(t *testing.T) {
 }
 
 func TestDuplicateDetectionSurvivesSnapshotRestore(t *testing.T) {
-	// Every node compacts past client 7's Delete, then the whole cluster
+	// Every node compacts past client c7's Delete, then the whole cluster
 	// restarts and rebuilds its state from those snapshots. A retry of the
 	// Delete must still be recognized as a duplicate.
 	for _, disk := range []bool{false, true} {
 		c := newCluster(t, 3, 1, disk)
 		c.setSnapshotEvery(3)
 		l := c.leader()
-		c.do(l, putReq(7, 1, "k", "v"))
-		c.do(l, deleteReq(7, 2, "k"))
+		c7 := c.register(l) // index 2
+		c.do(l, putReq(c7, 1, "k", "v"))
+		c.do(l, deleteReq(c7, 2, "k")) // index 4
+		c8 := c.register(l)
 		for i := range 6 {
-			c.do(l, putReq(8, uint64(i+1), "other", fmt.Sprint(i)))
+			c.do(l, putReq(c8, uint64(i+1), "other", fmt.Sprint(i)))
 		}
 		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
 		for _, id := range c.ids {
@@ -186,10 +193,10 @@ func TestDuplicateDetectionSurvivesSnapshotRestore(t *testing.T) {
 			}
 		}
 		l = c.leader()
-		if res := c.do(l, deleteReq(7, 2, "k")); !res.Found {
+		if res := c.do(l, deleteReq(c7, 2, "k")); !res.Found {
 			t.Fatalf("disk=%v: retried delete after restore reported not found", disk)
 		}
-		if res := c.wait(c.submit(l, putReq(7, 1, "k", "v")), 2*requestTimeout); !errors.Is(res.Err, ErrStaleSequence) {
+		if res := c.wait(c.submit(l, putReq(c7, 1, "k", "v")), 2*requestTimeout); !errors.Is(res.Err, ErrStaleSequence) {
 			t.Fatalf("disk=%v: old write after restore: %+v, want ErrStaleSequence", disk, res)
 		}
 		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
@@ -204,8 +211,9 @@ func TestFollowerCatchesUpBySnapshot(t *testing.T) {
 		l := c.leader()
 		f := others(c.ids, l)[0]
 		c.net.Partition([]uint64{f}, others(c.ids, f))
+		id := c.register(l)
 		for i := range 30 {
-			c.do(l, putReq(1, uint64(i+1), fmt.Sprint("k", i%4), fmt.Sprint(i)))
+			c.do(l, putReq(id, uint64(i+1), fmt.Sprint("k", i%4), fmt.Sprint(i)))
 		}
 		if s, last := c.nodes[l].raft.Status().Snapshot, c.nodes[f].raft.Status().LastIndex; s <= last {
 			c.fatalf("leader's snapshot at %d does not pass the follower's last index %d", s, last)
@@ -219,7 +227,7 @@ func TestFollowerCatchesUpBySnapshot(t *testing.T) {
 func TestReadsAreBatched(t *testing.T) {
 	c := newCluster(t, 3, 1, false)
 	l := c.leader()
-	c.do(l, putReq(1, 1, "k", "v"))
+	c.do(l, putReq(c.register(l), 1, "k", "v"))
 	first := c.nodes[l].lastID
 	var calls []*call
 	for range 10 {
@@ -242,10 +250,11 @@ func TestReadSeesPrecedingWrite(t *testing.T) {
 	// leader, including just after an election.
 	for seed := range uint64(20) {
 		c := newCluster(t, 3, seed, false)
+		id := c.register(c.leader())
 		for i := range 5 {
 			l := c.leader()
 			v := fmt.Sprint(i)
-			c.do(l, putReq(1, uint64(i+1), "k", v))
+			c.do(l, putReq(id, uint64(i+1), "k", v))
 			if res := c.do(l, getReq("k")); string(res.Value) != v {
 				c.fatalf("read %q after writing %q", res.Value, v)
 			}
@@ -306,8 +315,9 @@ func TestRestartedNodeRebuildsState(t *testing.T) {
 	for _, disk := range []bool{false, true} {
 		c := newCluster(t, 3, 1, disk)
 		l := c.leader()
+		id := c.register(l)
 		for i := range 20 {
-			c.do(l, putReq(1, uint64(i+1), fmt.Sprint("k", i%5), fmt.Sprint(i)))
+			c.do(l, putReq(id, uint64(i+1), fmt.Sprint("k", i%5), fmt.Sprint(i)))
 		}
 		for _, id := range c.ids {
 			c.crash(id)
@@ -322,6 +332,37 @@ func TestRestartedNodeRebuildsState(t *testing.T) {
 			}
 		}
 		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
+		c.checkReplicasAgree()
+	}
+}
+
+func TestEvictedClientRetryIsRefused(t *testing.T) {
+	// The leader applies client a's Put and crashes before replying. While
+	// a waits, two other clients register on the next leader, which keeps
+	// two sessions, so a's is evicted, and one of them overwrites k. a's
+	// retry must be refused, not applied as a new write that rolls k back,
+	// and every replica must have evicted the same session.
+	for seed := range uint64(10) {
+		c := newCluster(t, 3, seed, seed%2 == 1, withMaxSessions(2))
+		l := c.leader()
+		a := c.register(l)
+		c.do(l, putReq(a, 1, "k", "old"))
+		c.waitApplied(c.nodes[l].sm.Applied(), 10*electionTick)
+		c.crash(l)
+
+		next := c.leaderAmong(others(c.ids, l), 30*electionTick)
+		b := c.register(next)
+		c.do(next, putReq(b, 1, "k", "new"))
+		c.register(next)
+		res := c.wait(c.submit(next, putReq(a, 1, "k", "old")), 2*requestTimeout)
+		if !errors.Is(res.Err, ErrSessionExpired) {
+			c.fatalf("retry from evicted client: %+v, want ErrSessionExpired", res)
+		}
+		if res := c.do(next, getReq("k")); string(res.Value) != "new" {
+			c.fatalf("k = %q after the refused retry, want new", res.Value)
+		}
+		c.start(l)
+		c.waitApplied(c.nodes[next].sm.Applied(), 20*electionTick)
 		c.checkReplicasAgree()
 	}
 }

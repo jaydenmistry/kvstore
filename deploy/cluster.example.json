@@ -8,5 +8,6 @@
   "election_tick": 10,
   "heartbeat_tick": 2,
   "request_timeout": "3s",
-  "snapshot_every": 10000
+  "snapshot_every": 10000,
+  "max_sessions": 10000
 }

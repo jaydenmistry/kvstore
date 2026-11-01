@@ -20,7 +20,8 @@ const three = `{
   "election_tick": 20,
   "heartbeat_tick": 3,
   "request_timeout": "2s",
-  "snapshot_every": -1
+  "snapshot_every": -1,
+  "max_sessions": 7
 }`
 
 func TestParse(t *testing.T) {
@@ -29,7 +30,7 @@ func TestParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if time.Duration(c.Tick) != 20*time.Millisecond || c.ElectionTick != 20 || c.HeartbeatTick != 3 ||
-		time.Duration(c.RequestTimeout) != 2*time.Second || c.SnapshotEvery != -1 {
+		time.Duration(c.RequestTimeout) != 2*time.Second || c.SnapshotEvery != -1 || c.MaxSessions != 7 {
 		t.Fatalf("parsed %+v", c)
 	}
 	if p := c.Peers(); len(p) != 3 || p[2] != (server.Peer{Raft: "127.0.0.1:7002", API: "127.0.0.1:8002"}) {

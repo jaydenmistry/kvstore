@@ -118,14 +118,15 @@ func isTerminal(f *os.File) bool {
 
 func status(ctx context.Context, urls []string) int {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SERVER\tID\tSTATE\tTERM\tLEADER\tCOMMIT\tAPPLIED\tLAST\tSNAPSHOT")
+	fmt.Fprintln(w, "SERVER\tID\tSTATE\tTERM\tLEADER\tCOMMIT\tAPPLIED\tLAST\tSNAPSHOT\tSESSIONS")
 	for _, u := range urls {
 		st, err := fetchStatus(ctx, u)
 		if err != nil {
 			fmt.Fprintf(w, "%s\tunreachable: %v\n", u, err)
 			continue
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\n", u, st.ID, st.State, st.Term, st.Leader, st.Commit, st.Applied, st.LastIndex, st.Snapshot)
+		fmt.Fprintf(w, "%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+			u, st.ID, st.State, st.Term, st.Leader, st.Commit, st.Applied, st.LastIndex, st.Snapshot, st.Sessions)
 	}
 	w.Flush()
 	return 0

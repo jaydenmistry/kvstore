@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,12 +14,14 @@ import (
 	"time"
 )
 
-// fake is a scripted server. handle is called for each request; it runs on
-// the server's goroutines, so the log is guarded.
+// fake is a scripted server. handle is called for each request to /kv/; it
+// runs on the server's goroutines, so the log is guarded. Registrations get
+// client IDs 101, 102, ...
 type fake struct {
 	*httptest.Server
-	mu   sync.Mutex
-	reqs []*http.Request
+	mu       sync.Mutex
+	reqs     []*http.Request
+	sessions int
 }
 
 func newFake(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, n int)) *fake {
@@ -31,6 +34,13 @@ func newFake(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, n
 		n := len(f.reqs)
 		f.mu.Unlock()
 		handle(w, r, n)
+	})
+	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.sessions++
+		id := 100 + f.sessions
+		f.mu.Unlock()
+		fmt.Fprintln(w, id)
 	})
 	f.Server = httptest.NewServer(mux)
 	t.Cleanup(f.Close)
@@ -231,5 +241,57 @@ func TestSpreadStartsAtRandomServers(t *testing.T) {
 		if len(f.requests()) < 40 {
 			t.Fatalf("with Spread, server %d got %d requests", i, len(f.requests()))
 		}
+	}
+}
+
+func TestRegistersBeforeFirstWrite(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, n int) { w.WriteHeader(http.StatusNoContent) })
+	c := newClient(t, f.URL)
+	if _, _, err := c.Get(ctx(t), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if f.sessions != 0 || c.ID() != 0 {
+		t.Fatalf("a read registered a session (%d sessions, ID %d)", f.sessions, c.ID())
+	}
+	for range 2 {
+		if err := c.Put(ctx(t), "k", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.sessions != 1 || c.ID() != 101 {
+		t.Fatalf("%d sessions, ID %d; want one session, ID 101", f.sessions, c.ID())
+	}
+	for _, r := range f.requests()[1:] {
+		if id := r.Header.Get(headerClientID); id != "101" {
+			t.Fatalf("write carried client ID %q, want 101", id)
+		}
+	}
+}
+
+func TestSessionExpiredStartsNewSession(t *testing.T) {
+	f := newFake(t, func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 2 {
+			http.Error(w, "session expired", http.StatusGone)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	c := newClient(t, f.URL)
+	if err := c.Put(ctx(t), "k", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(ctx(t), "k", nil); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("err = %v, want ErrSessionExpired", err)
+	}
+	if n := len(f.requests()); n != 2 {
+		t.Fatalf("%d attempts, want 2: an expired session is not retried", n)
+	}
+	if err := c.Put(ctx(t), "k", nil); err != nil {
+		t.Fatal(err)
+	}
+	r := f.requests()[2]
+	if f.sessions != 2 || r.Header.Get(headerClientID) != "102" || r.Header.Get(headerSeq) != "1" {
+		t.Fatalf("after expiry: %d sessions, write as client %s seq %s; want a new session 102 starting at seq 1",
+			f.sessions, r.Header.Get(headerClientID), r.Header.Get(headerSeq))
 	}
 }

@@ -27,10 +27,14 @@ type Request struct {
 	Key   string
 	Value []byte // OpPut only
 	// ClientID and Seq identify a write for duplicate detection (see
-	// Command). Reads change nothing and need neither.
+	// Command). Reads change nothing and need neither. OpRegister, which
+	// returns a new client ID in Result.ClientID, takes no fields.
 	ClientID uint64
 	Seq      uint64
 }
+
+// DefaultMaxSessions is the default for Config.MaxSessions.
+const DefaultMaxSessions = 10000
 
 // Replica connects client requests to one Raft node and its state machine.
 // Like raft.Raft it is single-threaded and driven from outside: Tick at a
@@ -47,6 +51,7 @@ type Replica struct {
 	sm            *StateMachine
 	timeout       int // ticks
 	snapshotEvery uint64
+	maxSessions   uint64
 	now           int // ticks since creation
 
 	// term is the term in which this node accepted the pending requests as
@@ -84,6 +89,11 @@ type Config struct {
 	// machine and compact the Raft log whenever that many entries have been
 	// applied since the last snapshot (§7). Zero disables compaction.
 	SnapshotEvery uint64
+	// MaxSessions is how many client sessions the state machine keeps
+	// (see OpRegister). Zero means DefaultMaxSessions. The leader writes it
+	// into each registration, so a change takes effect when a node with
+	// the new value leads.
+	MaxSessions uint64
 }
 
 // NewReplica returns a Replica driving r, which must be newly created: the
@@ -93,7 +103,13 @@ func NewReplica(r *raft.Raft, cfg Config) *Replica {
 	if cfg.RequestTimeout <= 0 {
 		panic("kv: RequestTimeout must be positive")
 	}
-	return &Replica{raft: r, sm: NewStateMachine(), timeout: cfg.RequestTimeout, snapshotEvery: cfg.SnapshotEvery}
+	if cfg.MaxSessions == 0 {
+		cfg.MaxSessions = DefaultMaxSessions
+	}
+	return &Replica{
+		raft: r, sm: NewStateMachine(),
+		timeout: cfg.RequestTimeout, snapshotEvery: cfg.SnapshotEvery, maxSessions: cfg.MaxSessions,
+	}
 }
 
 // Raft returns the Raft node, for status and tests.
@@ -101,6 +117,9 @@ func (p *Replica) Raft() *raft.Raft { return p.raft }
 
 // Applied returns the index of the last entry applied to the state machine.
 func (p *Replica) Applied() uint64 { return p.sm.Applied() }
+
+// Sessions returns how many client sessions the state machine holds.
+func (p *Replica) Sessions() int { return len(p.sm.sessions) }
 
 // Submit starts a request. done is called exactly once with the outcome,
 // either before Submit returns or during a later call to Submit, Tick, or
@@ -121,8 +140,11 @@ func (p *Replica) Submit(req Request, done func(Result)) error {
 			return nil
 		}
 		p.queued = append(p.queued, pendingRead{key: req.Key, deadline: p.now + p.timeout, done: done})
-	case OpPut, OpDelete:
+	case OpPut, OpDelete, OpRegister:
 		c := Command{Op: req.Op, ClientID: req.ClientID, Seq: req.Seq, Key: req.Key, Value: req.Value}
+		if req.Op == OpRegister {
+			c.MaxSessions = p.maxSessions
+		}
 		if err := c.validate(); err != nil {
 			done(Result{Err: err})
 			return nil

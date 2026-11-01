@@ -11,7 +11,7 @@
 //	    -peer 2=10.0.0.2:7001,10.0.0.2:8001 \
 //	    -peer 3=10.0.0.3:7001,10.0.0.3:8001
 //
-// -tick and -snapshot-every, if given, override the file.
+// -tick, -snapshot-every, and -max-sessions, if given, override the file.
 //
 // Exit status is 0 after SIGINT or SIGTERM, 2 for bad usage, 1 if the node
 // could not start, and 3 (exitFatal) if storage or the state machine failed.
@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/jaydenmistry/kvstore/internal/config"
+	"github.com/jaydenmistry/kvstore/internal/kv"
 	"github.com/jaydenmistry/kvstore/internal/server"
 	"github.com/jaydenmistry/kvstore/internal/vfs"
 )
@@ -56,6 +57,7 @@ func run() int {
 	dataDir := flag.String("data", "", "data `directory`")
 	tick := flag.Duration("tick", server.DefaultTickInterval, "Raft tick `interval`")
 	snapEvery := flag.Int("snapshot-every", server.DefaultSnapshotEvery, "compact the log after this many applied `entries`; negative disables")
+	maxSessions := flag.Uint64("max-sessions", uint64(kv.DefaultMaxSessions), "client `sessions` the cluster keeps before evicting the least recently used")
 	checkQuorum := flag.Bool("check-quorum", true, "leaders step down when cut off from a majority; turn off only for testing")
 	preVote := flag.Bool("pre-vote", true, "nodes check they could win before starting an election; turn off only for testing")
 	flag.Parse()
@@ -65,7 +67,7 @@ func run() int {
 		return exitUsage
 	}
 	cfg := server.Config{
-		ID: *id, Peers: peers, DataDir: *dataDir, TickInterval: *tick, SnapshotEvery: *snapEvery,
+		ID: *id, Peers: peers, DataDir: *dataDir, TickInterval: *tick, SnapshotEvery: *snapEvery, MaxSessions: *maxSessions,
 		DisableCheckQuorum: !*checkQuorum, DisablePreVote: !*preVote,
 	}
 	if *configPath != "" {
@@ -80,6 +82,7 @@ func run() int {
 		cfg.HeartbeatTick = c.HeartbeatTick
 		cfg.RequestTimeout = time.Duration(c.RequestTimeout)
 		cfg.SnapshotEvery = c.SnapshotEvery
+		cfg.MaxSessions = c.MaxSessions
 		// Flags given explicitly override the file.
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
@@ -87,6 +90,8 @@ func run() int {
 				cfg.TickInterval = *tick
 			case "snapshot-every":
 				cfg.SnapshotEvery = *snapEvery
+			case "max-sessions":
+				cfg.MaxSessions = *maxSessions
 			}
 		})
 	}

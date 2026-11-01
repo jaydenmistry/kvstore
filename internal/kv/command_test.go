@@ -13,12 +13,15 @@ func TestCommandRoundTrip(t *testing.T) {
 		{Op: OpPut, ClientID: 1<<64 - 1, Seq: 1<<64 - 1, Key: "key/with/slashes", Value: nil},
 		{Op: OpPut, ClientID: 2, Seq: 3, Key: string([]byte{0, 0xff}), Value: bytes.Repeat([]byte{0}, MaxValueSize)},
 		{Op: OpDelete, ClientID: 9, Seq: 4, Key: strings.Repeat("k", MaxKeySize)},
+		{Op: OpRegister, MaxSessions: 1},
+		{Op: OpRegister, MaxSessions: 1<<64 - 1},
 	} {
 		got, err := DecodeCommand(c.Encode())
 		if err != nil {
 			t.Fatalf("decode %v %q: %v", c.Op, c.Key, err)
 		}
-		if got.Op != c.Op || got.ClientID != c.ClientID || got.Seq != c.Seq || got.Key != c.Key || !bytes.Equal(got.Value, c.Value) {
+		if got.Op != c.Op || got.ClientID != c.ClientID || got.Seq != c.Seq || got.Key != c.Key ||
+			!bytes.Equal(got.Value, c.Value) || got.MaxSessions != c.MaxSessions {
 			t.Fatalf("round trip changed %+v into %+v", c, got)
 		}
 	}
@@ -38,6 +41,12 @@ func TestDecodeRejectsMalformed(t *testing.T) {
 		"delete value": (&Command{Op: OpDelete, ClientID: 1, Seq: 1, Key: "k", Value: []byte("v")}).Encode(),
 		"long key":     (&Command{Op: OpPut, ClientID: 1, Seq: 1, Key: strings.Repeat("k", MaxKeySize+1)}).Encode(),
 		"long value":   (&Command{Op: OpPut, ClientID: 1, Seq: 1, Key: "k", Value: make([]byte, MaxValueSize+1)}).Encode(),
+		"zero limit":   (&Command{Op: OpRegister}).Encode(),
+		"register key": (&Command{Op: OpRegister, Key: "k", MaxSessions: 5}).Encode(),
+		"register id":  (&Command{Op: OpRegister, ClientID: 1, MaxSessions: 5}).Encode(),
+		"register seq": (&Command{Op: OpRegister, Seq: 1, MaxSessions: 5}).Encode(),
+		"short limit":  (&Command{Op: OpRegister, MaxSessions: 5}).Encode()[:commandHeaderSize+7],
+		"long limit":   append((&Command{Op: OpRegister, MaxSessions: 5}).Encode(), 0),
 	}
 	for name, b := range cases {
 		if _, err := DecodeCommand(b); !errors.Is(err, ErrInvalid) {
@@ -62,6 +71,7 @@ func TestDecodedValueDoesNotGrowIntoBuffer(t *testing.T) {
 func FuzzDecodeCommand(f *testing.F) {
 	f.Add((&Command{Op: OpPut, ClientID: 1, Seq: 1, Key: "k", Value: []byte("v")}).Encode())
 	f.Add((&Command{Op: OpDelete, ClientID: 7, Seq: 2, Key: "key"}).Encode())
+	f.Add((&Command{Op: OpRegister, MaxSessions: 10}).Encode())
 	f.Fuzz(func(t *testing.T, b []byte) {
 		c, err := DecodeCommand(b)
 		if err != nil {

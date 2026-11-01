@@ -29,6 +29,9 @@ const (
 	OpGet Op = iota + 1
 	OpPut
 	OpDelete
+	// OpRegister opens a client session (thesis §6.3). Its client ID is
+	// the index of the log entry that registers it.
+	OpRegister
 )
 
 func (o Op) String() string {
@@ -39,6 +42,8 @@ func (o Op) String() string {
 		return "put"
 	case OpDelete:
 		return "delete"
+	case OpRegister:
+		return "register"
 	}
 	return fmt.Sprintf("op(%d)", uint8(o))
 }
@@ -47,22 +52,37 @@ func (o Op) String() string {
 //
 // ClientID and Seq identify the request for duplicate detection (§8): a
 // client numbers its writes 1, 2, 3, ... and reuses the number when it
-// retries, so a write that reaches the log twice is applied only once.
+// retries, so a write that reaches the log twice is applied only once. The
+// client ID comes from an OpRegister command, which has neither.
 type Command struct {
-	Op       Op // OpPut or OpDelete
+	Op       Op // OpPut, OpDelete, or OpRegister
 	ClientID uint64
 	Seq      uint64
 	Key      string
 	Value    []byte // OpPut only
+	// MaxSessions, for OpRegister, is how many sessions the state machine
+	// may hold once this one is added; it evicts the least recently used
+	// to make room. It travels in the log, rather than being configured on
+	// each node, so every replica evicts the same sessions even if their
+	// configurations differ.
+	MaxSessions uint64
 }
 
 // ErrInvalid wraps every validation error.
 var ErrInvalid = errors.New("kv: invalid request")
 
 func (c *Command) validate() error {
+	if c.Op == OpRegister {
+		if c.ClientID != 0 || c.Seq != 0 || c.Key != "" || len(c.Value) > 0 || c.MaxSessions == 0 {
+			return fmt.Errorf("%w: register takes only a nonzero session limit", ErrInvalid)
+		}
+		return nil
+	}
 	switch {
 	case c.Op != OpPut && c.Op != OpDelete:
 		return fmt.Errorf("%w: %v is not a write", ErrInvalid, c.Op)
+	case c.MaxSessions != 0:
+		return fmt.Errorf("%w: only register has a session limit", ErrInvalid)
 	case c.ClientID == 0 || c.Seq == 0:
 		return fmt.Errorf("%w: client ID and sequence number must be nonzero", ErrInvalid)
 	case c.Op == OpDelete && len(c.Value) > 0:
@@ -87,7 +107,8 @@ func validateKV(key string, value []byte) error {
 //
 //	| op u8 | client u64 | seq u64 | key length u32 | key | value |
 //
-// The value runs to the end. Integers are big-endian.
+// The value runs to the end. Integers are big-endian. For OpRegister, the
+// value is MaxSessions as a u64.
 const commandHeaderSize = 1 + 8 + 8 + 4
 
 // Encode returns c in its log encoding.
@@ -98,6 +119,9 @@ func (c *Command) Encode() []byte {
 	binary.BigEndian.PutUint64(b[9:], c.Seq)
 	binary.BigEndian.PutUint32(b[17:], uint32(len(c.Key)))
 	b = append(b, c.Key...)
+	if c.Op == OpRegister {
+		return binary.BigEndian.AppendUint64(b, c.MaxSessions)
+	}
 	return append(b, c.Value...)
 }
 
@@ -117,7 +141,13 @@ func DecodeCommand(b []byte) (Command, error) {
 		Seq:      binary.BigEndian.Uint64(b[9:]),
 		Key:      string(rest[:klen]),
 	}
-	if v := rest[klen:]; len(v) > 0 {
+	v := rest[klen:]
+	switch {
+	case c.Op == OpRegister && len(v) == 8:
+		c.MaxSessions = binary.BigEndian.Uint64(v)
+	case c.Op == OpRegister:
+		return Command{}, fmt.Errorf("%w: register value is %d bytes, not 8", ErrInvalid, len(v))
+	case len(v) > 0:
 		c.Value = v[:len(v):len(v)]
 	}
 	if err := c.validate(); err != nil {

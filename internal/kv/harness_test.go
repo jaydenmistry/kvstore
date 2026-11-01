@@ -39,6 +39,8 @@ type cluster struct {
 	// checkQuorum and preVote are passed to every node's raft.Config.
 	checkQuorum bool
 	preVote     bool
+	// maxSessions is passed to every Replica.
+	maxSessions uint64
 }
 
 // clusterOption configures a cluster before its nodes start.
@@ -50,6 +52,10 @@ func withCheckQuorum(on bool) clusterOption {
 
 func withPreVote(on bool) clusterOption {
 	return func(c *cluster) { c.preVote = on }
+}
+
+func withMaxSessions(n uint64) clusterOption {
+	return func(c *cluster) { c.maxSessions = n }
 }
 
 // setSnapshotEvery sets how often every node, running or restarted later,
@@ -125,7 +131,7 @@ func (c *cluster) start(id uint64) {
 	if err != nil {
 		c.fatalf("starting node %d: %v", id, err)
 	}
-	c.nodes[id] = NewReplica(r, Config{RequestTimeout: requestTimeout, SnapshotEvery: c.snapshotEvery})
+	c.nodes[id] = NewReplica(r, Config{RequestTimeout: requestTimeout, SnapshotEvery: c.snapshotEvery, MaxSessions: c.maxSessions})
 	c.net.SetDown(id, false)
 }
 
@@ -240,6 +246,16 @@ func (c *cluster) do(id uint64, req Request) Result {
 		c.fatalf("%v %q on node %d: %v", req.Op, req.Key, id, res.Err)
 	}
 	return res
+}
+
+// register opens a client session through node id and returns its ID.
+func (c *cluster) register(id uint64) uint64 {
+	c.t.Helper()
+	res := c.do(id, Request{Op: OpRegister})
+	if res.ClientID == 0 {
+		c.fatalf("register on node %d returned no client ID", id)
+	}
+	return res.ClientID
 }
 
 func getReq(key string) Request { return Request{Op: OpGet, Key: key} }

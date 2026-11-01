@@ -2,14 +2,13 @@
 //
 // It finds the leader by following redirects, retries until it learns each
 // request's outcome, and numbers its writes so that retries are applied at
-// most once (see kv.Command).
+// most once (see kv.Command). Before its first write it registers a session
+// with the cluster, which assigns its client ID.
 package client
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +27,12 @@ const (
 	headerSeq      = "Kv-Seq"
 )
 
+// ErrSessionExpired means the cluster evicted this client's session, so it
+// could not tell whether the write was a retry of one already applied, and
+// refused it. The write's outcome is unknown: it may have been applied by an
+// earlier attempt. The client registers a new session for its next write.
+var ErrSessionExpired = errors.New("client: session expired; the write's outcome is unknown")
+
 // Client talks to a cluster. It sends one request at a time: concurrent
 // calls wait their turn. That is what duplicate detection assumes (the
 // cluster remembers only each client's latest write), so use one Client per
@@ -35,7 +40,6 @@ const (
 type Client struct {
 	servers []string // base URLs, e.g. http://10.0.0.1:8001
 	http    *http.Client
-	id      uint64
 
 	// AttemptTimeout bounds one HTTP attempt. MinBackoff and MaxBackoff
 	// bound the wait between attempts that found no leader.
@@ -49,28 +53,20 @@ type Client struct {
 	Spread bool
 
 	mu     sync.Mutex
+	id     uint64 // session's client ID; 0 until registered
 	seq    uint64
 	leader string // base URL of the last known leader, or ""
 	next   int    // index into servers of the next node to try
 }
 
 // New returns a client for the cluster whose API addresses are servers,
-// given as base URLs (http://host:port). Its client ID is random: 64 bits
-// make a collision between clients vanishingly unlikely without a
-// registration step.
+// given as base URLs (http://host:port).
 func New(servers []string) (*Client, error) {
 	if len(servers) == 0 {
 		return nil, errors.New("client: no servers")
 	}
-	var b [8]byte
-	var id uint64
-	for id == 0 {
-		rand.Read(b[:])
-		id = binary.BigEndian.Uint64(b[:])
-	}
 	return &Client{
 		servers: servers,
-		id:      id,
 		http: &http.Client{
 			// Redirects are followed here, not by net/http, so the client
 			// can remember where the leader is.
@@ -82,8 +78,13 @@ func New(servers []string) (*Client, error) {
 	}, nil
 }
 
-// ID returns the client's ID.
-func (c *Client) ID() uint64 { return c.id }
+// ID returns the client ID of the current session, or 0 if the client has
+// not registered one yet.
+func (c *Client) ID() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.id
+}
 
 // Error is a definite failure reported by the cluster, such as an invalid
 // request. Retrying the same request cannot succeed.
@@ -122,20 +123,49 @@ func EscapeKey(key string) string {
 func (c *Client) do(ctx context.Context, method, key string, body []byte) ([]byte, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.Spread {
+		c.leader, c.next = "", mrand.IntN(len(c.servers))
+	}
 	var seq uint64
 	if method != http.MethodGet {
+		if c.id == 0 {
+			if err := c.register(ctx); err != nil {
+				return nil, false, err
+			}
+		}
 		// One sequence number per write, kept for every retry.
 		c.seq++
 		seq = c.seq
 	}
-	if c.Spread {
-		c.leader, c.next = "", mrand.IntN(len(c.servers))
+	value, found, err := c.retry(ctx, method, "/kv/"+EscapeKey(key), body, seq)
+	if errors.Is(err, ErrSessionExpired) {
+		c.id, c.seq = 0, 0
 	}
+	return value, found, err
+}
+
+// register opens a session. Registrations are not deduplicated: if a retry
+// registers twice, the unused session is eventually evicted.
+func (c *Client) register(ctx context.Context) error {
+	data, _, err := c.retry(ctx, http.MethodPost, "/session", nil, 0)
+	if err != nil {
+		return fmt.Errorf("client: registering a session: %w", err)
+	}
+	id, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || id == 0 {
+		return fmt.Errorf("client: registering a session: bad client ID %q", data)
+	}
+	c.id = id
+	return nil
+}
+
+// retry sends a request until the cluster reports its outcome or ctx ends.
+func (c *Client) retry(ctx context.Context, method, path string, body []byte, seq uint64) ([]byte, bool, error) {
 	backoff := c.MinBackoff
 	redirects := 0
 	for {
 		base := c.target()
-		value, found, retry, err := c.attempt(ctx, base, method, key, body, seq)
+		value, found, retry, err := c.attempt(ctx, base, method, path, body, seq)
 		if !retry {
 			return value, found, err
 		}
@@ -170,10 +200,10 @@ func (c *Client) target() string {
 
 // attempt sends one HTTP request. retry reports whether the outcome is still
 // unknown.
-func (c *Client) attempt(ctx context.Context, base, method, key string, body []byte, seq uint64) (value []byte, found, retry bool, err error) {
+func (c *Client) attempt(ctx context.Context, base, method, path string, body []byte, seq uint64) (value []byte, found, retry bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, c.AttemptTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, base+"/kv/"+EscapeKey(key), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -197,6 +227,8 @@ func (c *Client) attempt(ctx context.Context, base, method, key string, body []b
 		return nil, true, false, nil
 	case http.StatusNotFound:
 		return nil, false, false, nil
+	case http.StatusGone:
+		return nil, false, false, ErrSessionExpired
 	case http.StatusTemporaryRedirect:
 		loc, err := resp.Location()
 		if err != nil {

@@ -43,7 +43,7 @@ func listen(t *testing.T, addr string) net.Listener {
 	return ln
 }
 
-func newTestCluster(t *testing.T, n int) *testCluster {
+func newTestCluster(t *testing.T, n int, opts ...func(*Config)) *testCluster {
 	t.Helper()
 	c := &testCluster{t: t, nodes: map[uint64]*node{}}
 	peers := map[uint64]Peer{}
@@ -63,6 +63,9 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 			// InstallSnapshot over TCP.
 			SnapshotEvery:  5,
 			RequestTimeout: time.Second, Logger: quiet,
+		}
+		for _, o := range opts {
+			o(&cfg)
 		}
 		c.nodes[id] = &node{cfg: cfg}
 		c.start(id, lns[id][0], lns[id][1])
@@ -301,5 +304,36 @@ func TestStorageFailureIsFatal(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("node kept running after fsync failed")
+	}
+}
+
+func TestEvictedSessionIsRefusedOverHTTP(t *testing.T) {
+	// With room for one session, b's registration evicts a's. a's next
+	// write is refused with 410 Gone, which the client reports as
+	// ErrSessionExpired, and a's write after that runs in a new session.
+	c := newTestCluster(t, 3, func(cfg *Config) { cfg.MaxSessions = 1 })
+	ctx := testCtx(t)
+	a, b := c.client(), c.client()
+	if err := a.Put(ctx, "k", []byte("a1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put(ctx, "k", []byte("b1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Put(ctx, "k", []byte("a2")); !errors.Is(err, client.ErrSessionExpired) {
+		t.Fatalf("write from evicted session: %v, want ErrSessionExpired", err)
+	}
+	if v, _, err := a.Get(ctx, "k"); err != nil || string(v) != "b1" {
+		t.Fatalf("Get = %q, %v; want b1, the refused write not applied", v, err)
+	}
+	if err := a.Put(ctx, "k", []byte("a3")); err != nil {
+		t.Fatalf("write in a new session: %v", err)
+	}
+	if v, _, err := b.Get(ctx, "k"); err != nil || string(v) != "a3" {
+		t.Fatalf("Get = %q, %v; want a3", v, err)
+	}
+	st, err := c.status(c.leader())
+	if err != nil || st.Sessions != 1 {
+		t.Fatalf("status %+v, %v; want 1 session", st, err)
 	}
 }
