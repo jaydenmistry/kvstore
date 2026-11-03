@@ -68,6 +68,11 @@ func New(servers []string) (*Client, error) {
 	return &Client{
 		servers: servers,
 		http: &http.Client{
+			// Each Client has its own connection pool, so it keeps its
+			// connection between requests. http.DefaultTransport keeps at
+			// most two idle connections per host for all its users, so
+			// many Clients sharing it reconnect for almost every request.
+			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 			// Redirects are followed here, not by net/http, so the client
 			// can remember where the leader is.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

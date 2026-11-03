@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -293,5 +295,57 @@ func TestSessionExpiredStartsNewSession(t *testing.T) {
 	if f.sessions != 2 || r.Header.Get(headerClientID) != "102" || r.Header.Get(headerSeq) != "1" {
 		t.Fatalf("after expiry: %d sessions, write as client %s seq %s; want a new session 102 starting at seq 1",
 			f.sessions, r.Header.Get(headerClientID), r.Header.Get(headerSeq))
+	}
+}
+
+func TestConcurrentClientsKeepTheirConnections(t *testing.T) {
+	// Several Clients in one process each send requests back to back. Each
+	// must reuse its connection rather than open one per request. The
+	// server holds every round's requests until all of them have arrived,
+	// so all the connections are busy at once and then idle at once.
+	const clients, rounds = 8, 3
+	var mu sync.Mutex
+	arrived := 0
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ch := release
+		if arrived++; arrived == clients {
+			close(release)
+			release, arrived = make(chan struct{}), 0
+		}
+		mu.Unlock()
+		<-ch
+		io.WriteString(w, "v")
+	}))
+	var conns atomic.Int64
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+	for range clients {
+		c := newClient(t, srv.URL)
+		wg.Go(func() {
+			for range rounds {
+				if _, _, err := c.Get(ctx(t), "k"); err != nil {
+					errs <- err
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if n := conns.Load(); n != clients {
+		t.Fatalf("%d clients sending %d requests each opened %d connections, want %d", clients, rounds, n, clients)
 	}
 }
