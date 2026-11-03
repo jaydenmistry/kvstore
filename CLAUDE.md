@@ -79,6 +79,12 @@ Create packages only when the phase that needs them begins.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
+- Client sessions (thesis §6.3): a client registers through the log (OpRegister)
+  and its ID is that entry's index, so an unknown ID always means an evicted
+  session. A write without a session is refused (ErrSessionExpired, HTTP 410,
+  outcome unknown), never applied. At most N sessions are kept, evicting the
+  least recently used by log index; N travels in each register entry, and
+  last-used indexes are in snapshots, so every replica evicts the same ones.
 - Snapshots (§7) hold only applied state, and must include the dedup sessions.
   `DiskStorage.SaveSnapshot` writes the snapshot file, then rewrites the WAL
   (each step: temp file, fsync, rename, fsync dir). A crash between the steps
