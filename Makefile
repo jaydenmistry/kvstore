@@ -3,7 +3,7 @@ BIN ?= bin
 STATICCHECK_VERSION ?= v0.8.2
 FUZZTIME ?= 30s
 
-.PHONY: all build test race vet fmtcheck staticcheck lint check fuzz chaos clean
+.PHONY: all build test race vet fmtcheck staticcheck lint check fuzz chaos bench clean
 
 all: lint race build
 
@@ -41,6 +41,10 @@ fuzz:
 # Not part of check: it takes a minute and depends on real timing.
 chaos:
 	scripts/chaos.sh $(CHAOS_ARGS)
+
+# Throughput and latency of a fresh local cluster; see cmd/kvbench.
+bench:
+	scripts/bench.sh $(BENCH_ARGS)
 
 clean:
 	rm -rf $(BIN)
