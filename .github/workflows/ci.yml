@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,3 +29,30 @@ jobs:
         run: make race
       - name: build
         run: make build
+
+  # Real processes under faults (cmd/kvchaos), checked for linearizability.
+  # One short run per push and pull request, and longer ones every night.
+  # A failed run's history, node logs, and data are kept as an artifact.
+  chaos:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: kvchaos
+        env:
+          RUNS: ${{ github.event_name == 'schedule' && 5 || 1 }}
+          DURATION: ${{ github.event_name == 'schedule' && '2m' || '30s' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/kvchaos"
+          TMPDIR="$RUNNER_TEMP/kvchaos" scripts/chaos.sh -duration "$DURATION"
+      - name: keep the failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvchaos
+          path: ${{ runner.temp }}/kvchaos/
+          if-no-files-found: ignore
