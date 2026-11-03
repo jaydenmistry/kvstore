@@ -88,8 +88,9 @@ type Server struct {
 	http    *http.Server
 	apiLn   net.Listener
 
-	ops     chan func() error // work for the loop
-	stopped chan struct{}     // closed when the loop exits
+	ops     chan func() error  // work for the loop
+	submits chan kv.Submission // client requests for the loop
+	stopped chan struct{}      // closed when the loop exits
 }
 
 // New opens the node's storage and starts its transport. raftLn and apiLn
@@ -164,6 +165,7 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		}),
 		apiLn:   apiLn,
 		ops:     make(chan func() error),
+		submits: make(chan kv.Submission),
 		stopped: make(chan struct{}),
 	}
 	s.http = &http.Server{Handler: s.handler(), ReadHeaderTimeout: 10 * time.Second}
@@ -216,6 +218,8 @@ func (s *Server) loop(ctx context.Context) error {
 			err = s.replica.Step(m)
 		case op := <-s.ops:
 			err = op()
+		case sub := <-s.submits:
+			err = s.replica.SubmitBatch(s.batch(sub))
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrFatal, err)
@@ -225,6 +229,24 @@ func (s *Server) loop(ctx context.Context) error {
 			last = st
 		}
 	}
+}
+
+// batch returns first and the requests already waiting behind it, up to
+// kv.MaxBatch, so their writes are group committed. Requests wait only
+// while the loop is busy, usually with the previous batch's fsync: there is
+// no timer, so a lone request is never held back to fill a batch, and
+// batches grow with the load.
+func (s *Server) batch(first kv.Submission) []kv.Submission {
+	subs := []kv.Submission{first}
+	for len(subs) < kv.MaxBatch {
+		select {
+		case sub := <-s.submits:
+			subs = append(subs, sub)
+		default:
+			return subs
+		}
+	}
+	return subs
 }
 
 // exec runs f on the loop goroutine and waits for it to finish.
@@ -246,11 +268,8 @@ func (s *Server) exec(ctx context.Context, f func()) error {
 // always completes a request within its timeout, unless the node stops.
 func (s *Server) submit(ctx context.Context, req kv.Request) (kv.Result, error) {
 	done := make(chan kv.Result, 1)
-	op := func() error {
-		return s.replica.Submit(req, func(res kv.Result) { done <- res })
-	}
 	select {
-	case s.ops <- op:
+	case s.submits <- kv.Submission{Req: req, Done: func(res kv.Result) { done <- res }}:
 	case <-ctx.Done():
 		return kv.Result{}, ctx.Err()
 	case <-s.stopped:
