@@ -82,6 +82,13 @@ Create packages only when the phase that needs them begins.
   writes become one `Propose`, so one storage write and one fsync. There is
   no timer: batches form only from requests that queued while the loop was
   busy, so a lone request is never delayed.
+- Pipelining: the leader probes a follower (one message per heartbeat or
+  response, `next` held still) until a success shows where its log ends,
+  then replicates (sends entries as they are appended and moves `next` past
+  them at once). A rejection goes back to probing. A rejection counts only
+  if it is above `match` and below `next`, and while probing only if it
+  answers the latest probe. Safety rests on the follower's consistency
+  check, never on `next`.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
