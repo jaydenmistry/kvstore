@@ -31,6 +31,7 @@ Module: `github.com/jaydenmistry/kvstore`. Go 1.27, Linux.
 cmd/kvserver/        node binary
 cmd/kvctl/           CLI client
 cmd/kvchaos/         real-process chaos test: link proxies, faults, linearizability check
+cmd/kvbench/         throughput and latency of a running cluster
 internal/vfs/        filesystem interface: OS implementation + crash-simulating in-memory FS
 internal/wal/        append-only log; one CRC32C frame per Append (crash-atomic batch); Raft-agnostic
 internal/raft/       consensus core; defines the Transport and Storage interfaces it consumes
@@ -132,6 +133,7 @@ Create packages only when the phase that needs them begins.
   that nodes converge. It is not deterministic and not part of `make check`.
   Half its clients use `client.Spread`, or stale leaders are never queried.
   Plant bugs by building a mutated kvserver and passing it with `-kvserver`.
+  CI runs it too: 30 s on every push, five 2-minute runs nightly.
 - When adding a safety test, plant the bug it targets in a scratch copy and confirm
   the test fails. A test that passes on broken code is not testing anything.
 
@@ -158,6 +160,7 @@ Create packages only when the phase that needs them begins.
 
 ## Commands
 
-`make build | test | race | vet | fmtcheck | staticcheck | lint | check | fuzz | chaos | clean`.
+`make build | test | race | vet | fmtcheck | staticcheck | lint | check | fuzz | chaos | bench | clean`.
 `scripts/cluster.sh start|stop|status|kill N|pause N|...` runs a local three-node cluster.
+`scripts/bench.sh` runs kvbench against a fresh one on the same ports.
 `staticcheck` runs a pinned version through `go run`, which keeps it out of go.mod.

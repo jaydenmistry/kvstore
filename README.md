@@ -44,7 +44,7 @@ There are no consensus libraries and no third-party dependencies. Everything is 
 | `internal/transport` | The TCP transport, plus a simulated network for tests that can drop, delay, duplicate, reorder, and partition messages. |
 | `internal/server`, `internal/client` | One node's HTTP API and wall-clock loop, and the Go client. |
 | `internal/linearize` | A linearizability checker used by the tests. |
-| `cmd/kvserver`, `cmd/kvctl`, `cmd/kvchaos` | The node binary, the CLI, and a chaos tester that runs real processes. |
+| `cmd/kvserver`, `cmd/kvctl`, `cmd/kvchaos`, `cmd/kvbench` | The node binary, the CLI, a chaos tester that runs real processes, and a benchmark. |
 
 ## Design decisions
 
@@ -77,14 +77,33 @@ Most of the effort in this project went into testing, since a distributed system
 - **Planted bugs.** Every safety test is checked by putting the bug it's meant to catch into a scratch copy of the code and confirming the test fails, since a test that passes on broken code isn't testing anything. For example, `kvchaos` catches a build that skips the leadership check on reads, and the simulation catches a state machine that forgets its sessions after a snapshot.
 - **Fuzzing** for the WAL, command, and snapshot decoders.
 
-Every commit has to pass `make check`, which runs gofmt, go vet, staticcheck, and the full test suite with the race detector. CI runs the same checks.
+Every commit has to pass `make check`, which runs gofmt, go vet, staticcheck, and the full test suite with the race detector. CI runs the same checks, plus a 30 second `kvchaos` run on every push and five 2 minute runs every night. If a chaos run fails, CI keeps its history and node logs so the failure can be looked at.
+
+## Performance
+
+I measured a three-node cluster with `scripts/bench.sh`, which starts a fresh local cluster and runs `kvbench` against it. Each client sends one request at a time, back to back, with 100 byte values spread over 1,000 keys. Everything ran on one machine (a 4-core Ryzen 3 PRO 5350GE with an NVMe SSD, on ext4), so the three nodes share one disk and there's no real network delay.
+
+| Operation | Clients | Throughput | p50 latency | p99 latency |
+|---|---:|---:|---:|---:|
+| Put | 1 | 920/s | 1.04 ms | 2.24 ms |
+| Put | 8 | 1,156/s | 6.68 ms | 12.21 ms |
+| Put | 64 | 1,178/s | 53.41 ms | 88.25 ms |
+| Get | 1 | 5,706/s | 0.17 ms | 0.24 ms |
+| Get | 8 | 23,718/s | 0.32 ms | 0.69 ms |
+| Get | 64 | 53,688/s | 1.07 ms | 3.54 ms |
+
+Writes top out at about 1,200 per second. A single write takes about 1 ms, which is two fsyncs in a row (the leader's, then a follower's, each about 0.43 ms on this disk) plus the HTTP round trip. More clients don't raise the throughput, they just wait longer, because the leader writes and fsyncs every entry on its own. The obvious next step is group commit, specifically writing all the entries that arrive during one fsync as a single WAL append. The WAL already supports that, since one `Append` can hold many records.
+
+Reads scale much better, up to about 54,000 per second with 64 clients, since they don't touch the disk. Each read still needs a heartbeat round to a majority (ReadIndex), but reads that arrive together share one round, so the more clients there are, the more reads each round serves.
+
+Running the benchmark also turned up a bug in the Go client. Every `Client` shared Go's default HTTP connection pool, which only keeps two idle connections per host, so concurrent clients were opening a new TCP connection for almost every request. Giving each `Client` its own pool raised read throughput with 32 clients from about 29,000 to 45,000 per second.
 
 ## Running it
 
 You need Go 1.27 on Linux.
 
 ```sh
-make build                       # builds bin/kvserver, bin/kvctl, bin/kvchaos
+make build                       # builds bin/kvserver, bin/kvctl, bin/kvchaos, bin/kvbench
 scripts/cluster.sh start         # starts a local three-node cluster
 bin/kvctl put greeting hello
 bin/kvctl get greeting
@@ -99,6 +118,7 @@ scripts/cluster.sh clean         # stop everything and delete the data
 make test     # unit and simulation tests
 make check    # the full pre-commit gate
 make chaos    # a 60 second real-process chaos run
+make bench    # throughput and latency of a fresh local cluster
 ```
 
 For a real deployment, `deploy/` has a systemd unit and an example cluster config. Every node gets the same JSON file listing the members, and is started with its own ID.
