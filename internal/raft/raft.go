@@ -242,15 +242,21 @@ func (r *Raft) Status() Status {
 	}
 }
 
-// Propose appends a command to the log. It succeeds only on the leader, and
-// returns the index and term the entry was given. A successful Propose does
-// not mean the entry will commit: if leadership changes first, a later
-// leader may overwrite it. The caller learns the outcome by watching
-// TakeCommitted for an entry at that index with that term.
+// Propose appends commands to the log, one entry each, in order. It
+// succeeds only on the leader, and returns the index of the first entry and
+// the term they were all given. A successful Propose does not mean the
+// entries will commit: if leadership changes first, a later leader may
+// overwrite them. The caller learns the outcome by watching TakeCommitted
+// for an entry at each index with that term.
 //
-// data must be nonempty (empty entries are the leader's no-ops). Raft keeps
-// its own copy.
-func (r *Raft) Propose(data []byte) (index, term uint64, err error) {
+// The entries are persisted in one storage write, so proposing many at once
+// costs one fsync instead of one each (group commit). That write is
+// crash-atomic, which is safe: none of the entries has been acknowledged
+// before it completes. Keep batches small enough for one storage write.
+//
+// Each command must be nonempty (empty entries are the leader's no-ops).
+// Raft keeps its own copies.
+func (r *Raft) Propose(data ...[]byte) (index, term uint64, err error) {
 	if r.err != nil {
 		return 0, 0, r.err
 	}
@@ -258,13 +264,19 @@ func (r *Raft) Propose(data []byte) (index, term uint64, err error) {
 		return 0, 0, ErrNotLeader
 	}
 	if len(data) == 0 {
-		return 0, 0, errors.New("raft: empty proposal")
+		return 0, 0, errors.New("raft: nothing to propose")
 	}
-	e := Entry{Index: r.lastIndex() + 1, Term: r.term, Data: bytes.Clone(data)}
-	if !r.appendAsLeader(e) {
+	ents := make([]Entry, len(data))
+	for i, d := range data {
+		if len(d) == 0 {
+			return 0, 0, errors.New("raft: empty proposal")
+		}
+		ents[i] = Entry{Index: r.lastIndex() + 1 + uint64(i), Term: r.term, Data: bytes.Clone(d)}
+	}
+	if !r.appendAsLeader(ents) {
 		return 0, 0, r.err
 	}
-	return e.Index, e.Term, nil
+	return ents[0].Index, r.term, nil
 }
 
 // TakeCommitted returns the entries committed since the previous call, in
@@ -863,14 +875,15 @@ func (r *Raft) advanceReads() {
 	}
 }
 
-// appendAsLeader adds e to the leader's own log, then sends it out.
-func (r *Raft) appendAsLeader(e Entry) bool {
-	if !r.saveEntries([]Entry{e}) {
+// appendAsLeader adds ents, which follow the last entry, to the leader's
+// own log in one storage write, then sends them out.
+func (r *Raft) appendAsLeader(ents []Entry) bool {
+	if !r.saveEntries(ents) {
 		return false
 	}
 	// The leader counts toward the majority only for entries it has
 	// durably stored, which saveEntries just did.
-	r.match[r.id] = e.Index
+	r.match[r.id] = ents[len(ents)-1].Index
 	r.maybeCommit()
 	r.broadcastAppend()
 	return true
@@ -974,7 +987,7 @@ func (r *Raft) becomeLeader() {
 	// only commit once an entry from this term does (see maybeCommit), so
 	// without it they could wait indefinitely for the next client command.
 	// Sending it also announces leadership at once.
-	r.appendAsLeader(Entry{Index: r.lastIndex() + 1, Term: r.term})
+	r.appendAsLeader([]Entry{{Index: r.lastIndex() + 1, Term: r.term}})
 }
 
 // wonElection reports whether granted votes form a majority of the cluster.

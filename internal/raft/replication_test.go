@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -316,6 +317,63 @@ func TestProposeErrors(t *testing.T) {
 	makeLeader(t, r)
 	if _, _, err := r.Propose(nil); err == nil {
 		t.Fatal("empty proposal accepted")
+	}
+}
+
+func TestProposeBatchIsOneStorageWrite(t *testing.T) {
+	// Group commit: a batch of commands costs one storage write and one
+	// fsync, made before any of them is sent, and they commit together.
+	r, st := newNode(t, 1, 1, 2, 3)
+	makeLeader(t, r)
+	takeSent(st)
+	st.ev.log = nil
+	idx, term, err := r.Propose([]byte("a"), []byte("b"), []byte("c"))
+	if err != nil || idx != 2 || term != 1 {
+		t.Fatalf("Propose = %d, %d, %v; want 2, 1, nil", idx, term, err)
+	}
+	saved := slices.DeleteFunc(slices.Clone(st.ev.log), func(e string) bool { return !strings.HasPrefix(e, "save") })
+	if !slices.Equal(saved, []string{"save entries 2-4"}) {
+		t.Fatalf("storage writes %q, want one write of entries 2-4", saved)
+	}
+	if !strings.HasPrefix(st.ev.log[0], "save") {
+		t.Fatalf("sent before persisting:\n%s", strings.Join(st.ev.log, "\n"))
+	}
+	// The followers have not acknowledged the no-op either, so it goes
+	// with the batch, in the same message.
+	for _, m := range takeSent(st) {
+		if n := len(m.Entries); n != 4 || m.Entries[n-1].Index != 4 {
+			t.Fatalf("MsgApp to %d carries %+v, want entries 1-4", m.To, m.Entries)
+		}
+	}
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 4})
+	if got := r.TakeCommitted(); len(got) != 4 || string(got[1].Data) != "a" || string(got[3].Data) != "c" {
+		t.Fatalf("TakeCommitted = %+v, want the no-op then a, b, c", got)
+	}
+}
+
+func TestProposeBatchFailsWhole(t *testing.T) {
+	// A batch with an empty command is refused before anything is stored.
+	r, st := newNode(t, 1, 1, 2, 3)
+	makeLeader(t, r)
+	takeSent(st)
+	if _, _, err := r.Propose([]byte("a"), nil); err == nil {
+		t.Fatal("batch with an empty proposal accepted")
+	}
+	if _, _, err := r.Propose(); err == nil {
+		t.Fatal("empty batch accepted")
+	}
+	if r.lastIndex() != 1 || len(takeSent(st)) != 0 {
+		t.Fatalf("refused batch changed the log (last index %d) or sent messages", r.lastIndex())
+	}
+
+	// If the storage write fails, none of the batch is in the log, nothing
+	// is sent, and the leader does not count itself as holding it.
+	st.fail = errors.New("disk on fire")
+	if _, _, err := r.Propose([]byte("a"), []byte("b")); !errors.Is(err, st.fail) {
+		t.Fatalf("Propose: err = %v, want storage error", err)
+	}
+	if r.lastIndex() != 1 || r.match[1] != 1 || len(takeSent(st)) != 0 {
+		t.Fatalf("after a failed write: last index %d, own match %d, want 1 and 1, and nothing sent", r.lastIndex(), r.match[1])
 	}
 }
 
