@@ -366,3 +366,59 @@ func TestEvictedClientRetryIsRefused(t *testing.T) {
 		c.checkReplicasAgree()
 	}
 }
+
+func TestSubmitBatchIsGroupCommitted(t *testing.T) {
+	// One client's writes, in order, in one batch, with a read, an invalid
+	// request, and a registration among them. The writes cost one storage
+	// write on the leader per MaxBatch, and take log entries in the order
+	// submitted: otherwise a lower sequence number would follow a higher
+	// one and be refused as stale.
+	c := newCluster(t, 3, 1, false)
+	l := c.leader()
+	id := c.register(l)
+	reqs := []Request{getReq("k"), {Op: OpRegister}}
+	for seq := uint64(1); seq <= MaxBatch+1; seq++ {
+		reqs = append(reqs, putReq(id, seq, "k", fmt.Sprint(seq)))
+		if seq == 10 {
+			reqs = append(reqs, putReq(id, 99, "", "invalid"))
+		}
+	}
+	before := c.saves[l]
+	calls := c.submitBatch(l, reqs)
+	if saves := c.saves[l] - before; saves != 2 {
+		t.Fatalf("%d storage writes for %d writes in one batch, want 2", saves, MaxBatch+2)
+	}
+	for i, cl := range calls {
+		res := c.wait(cl, 2*requestTimeout)
+		switch req := reqs[i]; {
+		case req.Key == "" && req.Op == OpPut:
+			if !errors.Is(res.Err, ErrInvalid) {
+				t.Fatalf("invalid request in a batch: %+v, want ErrInvalid", res)
+			}
+		case req.Op == OpRegister:
+			if res.Err != nil || res.ClientID == 0 {
+				t.Fatalf("registration in a batch: %+v", res)
+			}
+		case res.Err != nil:
+			t.Fatalf("%v %q seq %d in a batch: %v", req.Op, req.Key, req.Seq, res.Err)
+		}
+	}
+	if res := c.do(l, getReq("k")); string(res.Value) != fmt.Sprint(MaxBatch+1) {
+		t.Fatalf("k = %q after the batch, want the last write, %d", res.Value, MaxBatch+1)
+	}
+}
+
+func TestSubmitBatchOnFollower(t *testing.T) {
+	c := newCluster(t, 3, 1, false)
+	l := c.leader()
+	id := c.register(l)
+	f := c.ids[0]
+	if f == l {
+		f = c.ids[1]
+	}
+	for _, cl := range c.submitBatch(f, []Request{putReq(id, 1, "a", "x"), getReq("a"), putReq(id, 2, "b", "y")}) {
+		if !cl.done || !errors.Is(cl.res.Err, ErrNotLeader) || cl.res.Leader != l {
+			t.Fatalf("request on a follower: done %v, %+v; want ErrNotLeader naming %d", cl.done, cl.res, l)
+		}
+	}
+}

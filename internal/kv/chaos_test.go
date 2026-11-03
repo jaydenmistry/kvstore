@@ -107,13 +107,11 @@ func (cl *simClient) step(start bool) {
 	cl.attempt++
 	attempt := cl.attempt
 	cl.waiting, cl.deadline = true, c.ticks+clientTimeout
-	if err := c.nodes[node].Submit(cl.req, func(res Result) {
+	c.enqueue(node, Submission{Req: cl.req, Done: func(res Result) {
 		if attempt == cl.attempt && cl.waiting {
 			cl.handle(res)
 		}
-	}); err != nil {
-		c.fatalf("node %d Submit: %v", node, err)
-	}
+	}})
 }
 
 func (cl *simClient) handle(res Result) {
@@ -195,9 +193,12 @@ func TestLinearizableUnderChaos(t *testing.T) {
 					c.start(id)
 				}
 			}
+			// Requests to the same node in one tick are submitted
+			// together, so writes are group committed.
 			for _, cl := range clients {
 				cl.step(true)
 			}
+			c.flush()
 			c.tick()
 		}
 
@@ -217,6 +218,7 @@ func TestLinearizableUnderChaos(t *testing.T) {
 				cl.step(false)
 				idle = idle && cl.cur == nil && !cl.registering
 			}
+			c.flush()
 			if idle {
 				break
 			}

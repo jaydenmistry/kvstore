@@ -122,45 +122,78 @@ func (p *Replica) Applied() uint64 { return p.sm.Applied() }
 func (p *Replica) Sessions() int { return len(p.sm.sessions) }
 
 // Submit starts a request. done is called exactly once with the outcome,
-// either before Submit returns or during a later call to Submit, Tick, or
-// Step. done must not call back into the Replica.
+// either before Submit returns or during a later call to Submit,
+// SubmitBatch, Tick, or Step. done must not call back into the Replica.
 //
 // A non-nil error is fatal, as for raft.Raft: storage or the state machine
 // failed and the node has stopped. Pending requests are then abandoned.
 func (p *Replica) Submit(req Request, done func(Result)) error {
+	return p.SubmitBatch([]Submission{{Req: req, Done: done}})
+}
+
+// Submission is a request and the function to call with its outcome.
+type Submission struct {
+	Req  Request
+	Done func(Result)
+}
+
+// MaxBatch is the most writes SubmitBatch proposes together. They become
+// one storage write: at MaxValueSize each, 32 MiB, well under the WAL's
+// limit on one write. It is also as many entries as one AppendEntries
+// request carries (raft.DefaultMaxEntriesPerMessage).
+const MaxBatch = 64
+
+// SubmitBatch starts several requests, as Submit does each of them. The
+// writes among them are proposed together, up to MaxBatch at a time, so the
+// leader persists them in one storage write and one fsync instead of one
+// each (group commit). They are given log entries in the order of subs.
+func (p *Replica) SubmitBatch(subs []Submission) error {
 	p.checkLeadership()
-	switch req.Op {
-	case OpGet:
-		if err := validateKV(req.Key, nil); err != nil {
-			done(Result{Err: err})
-			return nil
+	var cmds [][]byte
+	var dones []func(Result)
+	for _, s := range subs {
+		req, done := s.Req, s.Done
+		switch req.Op {
+		case OpGet:
+			if err := validateKV(req.Key, nil); err != nil {
+				done(Result{Err: err})
+				continue
+			}
+			if p.term == 0 {
+				done(p.notLeader())
+				continue
+			}
+			p.queued = append(p.queued, pendingRead{key: req.Key, deadline: p.now + p.timeout, done: done})
+		case OpPut, OpDelete, OpRegister:
+			c := Command{Op: req.Op, ClientID: req.ClientID, Seq: req.Seq, Key: req.Key, Value: req.Value}
+			if req.Op == OpRegister {
+				c.MaxSessions = p.maxSessions
+			}
+			if err := c.validate(); err != nil {
+				done(Result{Err: err})
+				continue
+			}
+			cmds, dones = append(cmds, c.Encode()), append(dones, done)
+		default:
+			done(Result{Err: fmt.Errorf("%w: unknown op %v", ErrInvalid, req.Op)})
 		}
-		if p.term == 0 {
-			done(p.notLeader())
-			return nil
-		}
-		p.queued = append(p.queued, pendingRead{key: req.Key, deadline: p.now + p.timeout, done: done})
-	case OpPut, OpDelete, OpRegister:
-		c := Command{Op: req.Op, ClientID: req.ClientID, Seq: req.Seq, Key: req.Key, Value: req.Value}
-		if req.Op == OpRegister {
-			c.MaxSessions = p.maxSessions
-		}
-		if err := c.validate(); err != nil {
-			done(Result{Err: err})
-			return nil
-		}
-		index, term, err := p.raft.Propose(c.Encode())
-		if errors.Is(err, raft.ErrNotLeader) {
-			done(p.notLeader())
-			return nil
-		}
-		if err != nil {
+	}
+	for len(cmds) > 0 {
+		n := min(len(cmds), MaxBatch)
+		index, term, err := p.raft.Propose(cmds[:n]...)
+		switch {
+		case errors.Is(err, raft.ErrNotLeader):
+			for _, done := range dones[:n] {
+				done(p.notLeader())
+			}
+		case err != nil:
 			return err
+		default:
+			for i, done := range dones[:n] {
+				p.writes = append(p.writes, pendingWrite{index: index + uint64(i), term: term, deadline: p.now + p.timeout, done: done})
+			}
 		}
-		p.writes = append(p.writes, pendingWrite{index: index, term: term, deadline: p.now + p.timeout, done: done})
-	default:
-		done(Result{Err: fmt.Errorf("%w: unknown op %v", ErrInvalid, req.Op)})
-		return nil
+		cmds, dones = cmds[n:], dones[n:]
 	}
 	return p.update()
 }

@@ -41,6 +41,10 @@ type cluster struct {
 	preVote     bool
 	// maxSessions is passed to every Replica.
 	maxSessions uint64
+	// saves counts each node's storage writes that carry entries.
+	saves map[uint64]int
+	// queued holds requests for each node until flush submits them.
+	queued map[uint64][]Submission
 }
 
 // clusterOption configures a cluster before its nodes start.
@@ -78,6 +82,8 @@ func newCluster(t *testing.T, n int, seed uint64, disk bool, opts ...clusterOpti
 		net:     transport.NewNetwork(seed),
 		nodes:   map[uint64]*Replica{},
 		storage: map[uint64]raft.Storage{},
+		saves:   map[uint64]int{},
+		queued:  map[uint64][]Submission{},
 	}
 	if disk {
 		c.disks = map[uint64]*vfs.Mem{}
@@ -124,7 +130,7 @@ func (c *cluster) start(id uint64) {
 		HeartbeatTick: heartbeatTick,
 		CheckQuorum:   c.checkQuorum,
 		PreVote:       c.preVote,
-		Storage:       c.storage[id],
+		Storage:       countingStorage{c.storage[id], func() { c.saves[id]++ }},
 		Transport:     c.net.Endpoint(id),
 		Rand:          rand.New(rand.NewPCG(c.rng.Uint64(), id)),
 	})
@@ -133,6 +139,19 @@ func (c *cluster) start(id uint64) {
 	}
 	c.nodes[id] = NewReplica(r, Config{RequestTimeout: requestTimeout, SnapshotEvery: c.snapshotEvery, MaxSessions: c.maxSessions})
 	c.net.SetDown(id, false)
+}
+
+// countingStorage calls saved for each Save that carries entries.
+type countingStorage struct {
+	raft.Storage
+	saved func()
+}
+
+func (s countingStorage) Save(hs *raft.HardState, entries []raft.Entry) error {
+	if len(entries) > 0 {
+		s.saved()
+	}
+	return s.Storage.Save(hs, entries)
 }
 
 func (c *cluster) crash(id uint64) {
@@ -221,6 +240,48 @@ func (c *cluster) submit(id uint64, req Request) *call {
 		c.fatalf("node %d Submit: %v", id, err)
 	}
 	return cl
+}
+
+// submitBatch sends reqs to node id in one SubmitBatch call.
+func (c *cluster) submitBatch(id uint64, reqs []Request) []*call {
+	c.t.Helper()
+	var calls []*call
+	var subs []Submission
+	for _, req := range reqs {
+		cl := &call{}
+		calls = append(calls, cl)
+		subs = append(subs, Submission{Req: req, Done: func(res Result) {
+			if cl.done {
+				c.fatalf("request %+v completed twice", req)
+			}
+			cl.done, cl.res = true, res
+		}})
+	}
+	if err := c.nodes[id].SubmitBatch(subs); err != nil {
+		c.fatalf("node %d SubmitBatch: %v", id, err)
+	}
+	return calls
+}
+
+// enqueue holds a request for node id until the next flush, as a server
+// holds the requests that arrive while it is busy.
+func (c *cluster) enqueue(id uint64, s Submission) {
+	c.queued[id] = append(c.queued[id], s)
+}
+
+// flush submits each node's queued requests in one SubmitBatch call.
+func (c *cluster) flush() {
+	c.t.Helper()
+	for _, id := range c.ids {
+		subs := c.queued[id]
+		delete(c.queued, id)
+		if len(subs) == 0 {
+			continue
+		}
+		if err := c.nodes[id].SubmitBatch(subs); err != nil {
+			c.fatalf("node %d SubmitBatch: %v", id, err)
+		}
+	}
 }
 
 // wait ticks until cl completes and returns its result.
