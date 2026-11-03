@@ -135,6 +135,9 @@ type Raft struct {
 	// itself, updated whenever it appends to its own log.
 	next  map[uint64]uint64
 	match map[uint64]uint64
+	// probing holds the followers whose logs the leader has not yet
+	// matched: see sendAppend.
+	probing map[uint64]bool
 
 	// Leader only, for ReadIndex: the current heartbeat round, the highest
 	// round each peer has echoed back, and reads waiting for confirmation,
@@ -276,6 +279,7 @@ func (r *Raft) Propose(data ...[]byte) (index, term uint64, err error) {
 	if !r.appendAsLeader(ents) {
 		return 0, 0, r.err
 	}
+	r.broadcastEntries()
 	return ents[0].Index, r.term, nil
 }
 
@@ -771,21 +775,36 @@ func (r *Raft) handleAppendResp(m Message) {
 			r.match[p] = m.MatchIndex
 			r.maybeCommit()
 		}
-		r.next[p] = max(r.next[p], m.MatchIndex+1)
+		if r.probing[p] {
+			// The follower's log is now known to match up to match, so
+			// replication resumes from there.
+			r.probing[p] = false
+			r.next[p] = r.match[p] + 1
+		} else {
+			r.next[p] = max(r.next[p], r.match[p]+1)
+		}
+		// Only entries not yet sent: a response is not a reason to send
+		// again what is already on its way.
 		if r.next[p] <= r.lastIndex() {
-			r.sendAppend(p) // more to send
+			r.sendAppend(p)
 		}
 		return
 	}
-	// A rejection only counts if it answers the latest probe. An older one
-	// refers to a PrevLogIndex we have already moved below.
-	if m.RejectIndex != r.next[p]-1 {
+	// A rejection counts only if it is newer than what we know. While
+	// probing, it must answer the latest probe: an older one refers to a
+	// PrevLogIndex we have already moved below. While replicating, several
+	// messages may be in flight when one is lost, and each one after it is
+	// rejected; the first rejection starts probing, and the rest then fail
+	// this test.
+	if r.probing[p] && m.RejectIndex != r.next[p]-1 ||
+		m.RejectIndex <= r.match[p] || m.RejectIndex >= r.next[p] {
 		return
 	}
-	// The hint is at most RejectIndex, so next strictly decreases and the
-	// search terminates. It never drops to or below match: those entries
-	// are known to agree.
+	// The hint is at most RejectIndex, which is below next, so next
+	// strictly decreases and the search terminates. It never drops to or
+	// below match: those entries are known to agree.
 	r.next[p] = max(r.match[p]+1, min(m.HintIndex, m.RejectIndex))
+	r.probing[p] = true
 	r.sendAppend(p)
 }
 
@@ -876,7 +895,7 @@ func (r *Raft) advanceReads() {
 }
 
 // appendAsLeader adds ents, which follow the last entry, to the leader's
-// own log in one storage write, then sends them out.
+// own log in one storage write. The caller sends them out.
 func (r *Raft) appendAsLeader(ents []Entry) bool {
 	if !r.saveEntries(ents) {
 		return false
@@ -885,10 +904,28 @@ func (r *Raft) appendAsLeader(ents []Entry) bool {
 	// durably stored, which saveEntries just did.
 	r.match[r.id] = ents[len(ents)-1].Index
 	r.maybeCommit()
-	r.broadcastAppend()
 	return true
 }
 
+// sendAppend sends to an AppendEntries request carrying the entries from
+// next[to], up to the per-message limits. With none to carry, it is a
+// heartbeat.
+//
+// next is only a guess at where the follower's log ends; the follower's
+// consistency check (§5.3) is what keeps a wrong guess from doing harm, and
+// next never drops below match+1, which is known to be right. How the guess
+// moves depends on the follower's state:
+//
+//   - Probing: the leader has not matched the follower's log since it
+//     was elected, or since a rejection or a snapshot. next stays put
+//     until a response says where the log ends, and new entries are not
+//     sent on their own (see broadcastEntries), so at most one message
+//     per heartbeat or response is in flight. A success ends probing.
+//   - Replicating: the follower's log matched at the last response, so the
+//     leader sends entries as they come and moves next past them at once
+//     (pipelining). Each entry is sent once rather than again with every
+//     message until acknowledged. If one is lost, the follower rejects
+//     the next message, and the follower is probed again.
 func (r *Raft) sendAppend(to uint64) {
 	prev := r.next[to] - 1
 	if prev < r.log.index {
@@ -918,24 +955,42 @@ func (r *Raft) sendAppend(to uint64) {
 		LeaderCommit: r.commit,
 		Round:        r.round,
 	})
+	if !r.probing[to] {
+		r.next[to] = end + 1
+	}
 }
 
 // sendSnapshot sends the latest snapshot to a follower that needs entries
 // it replaced (§7).
 //
 // next moves past the snapshot at once, so the following heartbeats carry
-// the entries after it rather than the snapshot again. If the snapshot is
-// lost, the follower rejects those heartbeats, next falls back inside the
-// snapshot, and it is sent again. Over a transport that keeps order, as TCP
-// does, the snapshot arrives before the entries that follow it.
+// the entries after it rather than the snapshot again, and the follower is
+// probed until it acknowledges the snapshot. If the snapshot is lost, the
+// follower rejects those heartbeats, next falls back inside the snapshot,
+// and it is sent again. Over a transport that keeps order, as TCP does, the
+// snapshot arrives before the entries that follow it.
 func (r *Raft) sendSnapshot(to uint64) {
 	r.send(Message{Type: MsgSnap, To: to, Snapshot: r.snapshot, Round: r.round})
 	r.next[to] = r.snapshot.Index + 1
+	r.probing[to] = true
 }
 
+// broadcastAppend sends every follower an AppendEntries request, with any
+// entries it is due: a heartbeat, which also starts a ReadIndex round.
 func (r *Raft) broadcastAppend() {
 	for _, p := range r.peers {
 		if p != r.id {
+			r.sendAppend(p)
+		}
+	}
+}
+
+// broadcastEntries sends newly appended entries to the followers being
+// replicated to. Probed followers get them once a response shows where
+// their logs end.
+func (r *Raft) broadcastEntries() {
+	for _, p := range r.peers {
+		if p != r.id && !r.probing[p] {
 			r.sendAppend(p)
 		}
 	}
@@ -975,8 +1030,10 @@ func (r *Raft) becomeLeader() {
 	r.heartbeatElapsed = 0
 	r.next = make(map[uint64]uint64, len(r.peers))
 	r.match = make(map[uint64]uint64, len(r.peers))
+	r.probing = make(map[uint64]bool, len(r.peers))
 	for _, p := range r.peers {
 		r.next[p] = r.lastIndex() + 1
+		r.probing[p] = p != r.id
 	}
 	r.match[r.id] = r.lastIndex()
 	r.acked = make(map[uint64]uint64, len(r.peers))
@@ -987,7 +1044,9 @@ func (r *Raft) becomeLeader() {
 	// only commit once an entry from this term does (see maybeCommit), so
 	// without it they could wait indefinitely for the next client command.
 	// Sending it also announces leadership at once.
-	r.appendAsLeader([]Entry{{Index: r.lastIndex() + 1, Term: r.term}})
+	if r.appendAsLeader([]Entry{{Index: r.lastIndex() + 1, Term: r.term}}) {
+		r.broadcastAppend()
+	}
 }
 
 // wonElection reports whether granted votes form a majority of the cluster.

@@ -279,6 +279,117 @@ func TestLeaderSendsBatchesUntilCaughtUp(t *testing.T) {
 	}
 }
 
+// entriesOf returns the data of m's entries, joined by commas.
+func entriesOf(m Message) string {
+	var data []string
+	for _, e := range m.Entries {
+		data = append(data, string(e.Data))
+	}
+	return strings.Join(data, ",")
+}
+
+func TestReplicatingSendsEachEntryOnce(t *testing.T) {
+	// Once a follower's log has matched, each entry is sent to it once, as
+	// it is proposed, without waiting for earlier ones to be acknowledged.
+	r, st := newNode(t, 1, 1, 2, 3)
+	makeLeader(t, r) // no-op at 1
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 1})
+	takeSent(st)
+	for i, d := range []string{"a", "b", "c"} {
+		if _, _, err := r.Propose([]byte(d)); err != nil {
+			t.Fatal(err)
+		}
+		// Node 3 has not answered, so it is still being probed.
+		if m := onlyMessage(t, st); m.To != 2 || m.PrevLogIndex != uint64(i+1) || entriesOf(m) != d {
+			t.Fatalf("proposing %s sent %+v, want %s alone to node 2", d, m, d)
+		}
+	}
+	// A response is no reason to send again what is already on its way.
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 2})
+	if sent := takeSent(st); len(sent) != 0 {
+		t.Fatalf("a response resent %+v", sent)
+	}
+	// A heartbeat carries nothing for node 2, which has everything on its
+	// way, and probes node 3 from where it started.
+	if err := r.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range takeSent(st) {
+		switch {
+		case m.To == 2 && (m.PrevLogIndex != 4 || len(m.Entries) != 0):
+			t.Fatalf("heartbeat to node 2: %+v, want no entries after 4", m)
+		case m.To == 3 && (m.PrevLogIndex != 0 || len(m.Entries) != 4):
+			t.Fatalf("heartbeat to node 3: %+v, want entries 1-4", m)
+		}
+	}
+}
+
+func TestProbingSendsOneMessageAtATime(t *testing.T) {
+	// Until a follower answers, the leader does not know where its log
+	// ends, so proposals do not each send it another message: only
+	// heartbeats and its responses do.
+	r, st := newNode(t, 1, 1, 2, 3)
+	makeLeader(t, r)
+	takeSent(st)
+	r.Propose([]byte("a"))
+	r.Propose([]byte("b"))
+	if sent := takeSent(st); len(sent) != 0 {
+		t.Fatalf("proposals sent %+v to followers being probed", sent)
+	}
+	if err := r.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range takeSent(st) {
+		if m.PrevLogIndex != 0 || len(m.Entries) != 3 {
+			t.Fatalf("probe %+v, want entries 1-3", m)
+		}
+	}
+	// Node 2 answers, so it is replicated to from then on.
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 3})
+	if sent := takeSent(st); len(sent) != 0 {
+		t.Fatalf("sent %+v to a caught-up follower", sent)
+	}
+	r.Propose([]byte("c"))
+	if m := onlyMessage(t, st); m.To != 2 || m.PrevLogIndex != 3 || entriesOf(m) != "c" {
+		t.Fatalf("proposing c sent %+v, want c alone to node 2", m)
+	}
+}
+
+func TestLostMessageFallsBackToProbing(t *testing.T) {
+	r, st := newNode(t, 1, 1, 2, 3)
+	makeLeader(t, r) // no-op at 1
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 1})
+	for _, d := range []string{"a", "b", "c"} {
+		r.Propose([]byte(d))
+	}
+	takeSent(st)
+	// The message carrying a (entry 2) is lost, so node 2 rejects the two
+	// after it: it has nothing after entry 1.
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, RejectIndex: 2, HintIndex: 2})
+	if m := onlyMessage(t, st); m.PrevLogIndex != 1 || entriesOf(m) != "a,b,c" {
+		t.Fatalf("after a rejection sent %+v, want a probe with a, b, c", m)
+	}
+	// The second rejection answers a message sent before the probe.
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, RejectIndex: 3, HintIndex: 2})
+	if sent := takeSent(st); len(sent) != 0 {
+		t.Fatalf("an old rejection sent %+v", sent)
+	}
+	// While probing, a proposal waits for the probe's answer.
+	r.Propose([]byte("d"))
+	if sent := takeSent(st); len(sent) != 0 {
+		t.Fatalf("proposal sent %+v while probing", sent)
+	}
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 4})
+	if m := onlyMessage(t, st); m.PrevLogIndex != 4 || entriesOf(m) != "d" {
+		t.Fatalf("after the probe succeeded sent %+v, want d alone", m)
+	}
+	// Replicating again, a rejection of something below match is old news.
+	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, RejectIndex: 3, HintIndex: 2})
+	if sent := takeSent(st); len(sent) != 0 || r.probing[2] {
+		t.Fatalf("a rejection below match sent %+v, probing %v", sent, r.probing[2])
+	}
+}
+
 func TestLeaderCapsBatchBytes(t *testing.T) {
 	r, st := newNode(t, 1, 1, 2, 3)
 	r.maxMsgBytes = 10
@@ -289,7 +400,11 @@ func TestLeaderCapsBatchBytes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Node 2 is being replicated to, so each proposal went out at once.
+	// Send them again from the start, as after a lost message, to see how
+	// they are split: next moves past each message as it is sent.
 	takeSent(st)
+	r.next[2] = 2
 	var got []string
 	for range 4 {
 		r.sendAppend(2)
@@ -299,7 +414,6 @@ func TestLeaderCapsBatchBytes(t *testing.T) {
 			batch = append(batch, string(e.Data))
 		}
 		got = append(got, strings.Join(batch, ","))
-		r.next[2] += uint64(len(m.Entries))
 	}
 	// 4+4 bytes fit in 10, a third entry would not. The oversized entry
 	// goes alone rather than never.
@@ -325,6 +439,9 @@ func TestProposeBatchIsOneStorageWrite(t *testing.T) {
 	// fsync, made before any of them is sent, and they commit together.
 	r, st := newNode(t, 1, 1, 2, 3)
 	makeLeader(t, r)
+	for _, p := range []uint64{2, 3} {
+		mustStep(t, r, Message{Type: MsgAppResp, From: p, To: 1, Term: 1, Success: true, MatchIndex: 1})
+	}
 	takeSent(st)
 	st.ev.log = nil
 	idx, term, err := r.Propose([]byte("a"), []byte("b"), []byte("c"))
@@ -338,11 +455,13 @@ func TestProposeBatchIsOneStorageWrite(t *testing.T) {
 	if !strings.HasPrefix(st.ev.log[0], "save") {
 		t.Fatalf("sent before persisting:\n%s", strings.Join(st.ev.log, "\n"))
 	}
-	// The followers have not acknowledged the no-op either, so it goes
-	// with the batch, in the same message.
-	for _, m := range takeSent(st) {
-		if n := len(m.Entries); n != 4 || m.Entries[n-1].Index != 4 {
-			t.Fatalf("MsgApp to %d carries %+v, want entries 1-4", m.To, m.Entries)
+	sent := takeSent(st)
+	if len(sent) != 2 {
+		t.Fatalf("sent %d messages, want one to each follower", len(sent))
+	}
+	for _, m := range sent {
+		if len(m.Entries) != 3 || m.PrevLogIndex != 1 {
+			t.Fatalf("MsgApp to %d after %d carries %+v, want entries 2-4", m.To, m.PrevLogIndex, m.Entries)
 		}
 	}
 	mustStep(t, r, Message{Type: MsgAppResp, From: 2, To: 1, Term: 1, Success: true, MatchIndex: 4})
