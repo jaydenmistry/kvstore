@@ -83,16 +83,19 @@ Every commit has to pass `make check`, which runs gofmt, go vet, staticcheck, an
 
 I measured a three-node cluster with `scripts/bench.sh`, which starts a fresh local cluster and runs `kvbench` against it. Each client sends one request at a time, back to back, with 100 byte values spread over 1,000 keys. Everything ran on one machine (a 4-core Ryzen 3 PRO 5350GE with an NVMe SSD, on ext4), so the three nodes share one disk and there's no real network delay.
 
-| Operation | Clients | Throughput | p50 latency | p99 latency |
-|---|---:|---:|---:|---:|
-| Put | 1 | 920/s | 1.04 ms | 2.24 ms |
-| Put | 8 | 1,156/s | 6.68 ms | 12.21 ms |
-| Put | 64 | 1,178/s | 53.41 ms | 88.25 ms |
-| Get | 1 | 5,706/s | 0.17 ms | 0.24 ms |
-| Get | 8 | 23,718/s | 0.32 ms | 0.69 ms |
-| Get | 64 | 53,688/s | 1.07 ms | 3.54 ms |
+| Operation | Clients | Throughput | p50 latency | p99 latency | Throughput before group commit |
+|---|---:|---:|---:|---:|---:|
+| Put | 1 | 926/s | 1.03 ms | 2.26 ms | 920/s |
+| Put | 8 | 2,124/s | 3.66 ms | 7.35 ms | 1,156/s |
+| Put | 32 | 4,275/s | 7.23 ms | 13.90 ms | 1,205/s |
+| Put | 64 | 2,136/s | 29.63 ms | 41.08 ms | 1,178/s |
+| Get | 1 | 5,781/s | 0.17 ms | 0.22 ms | |
+| Get | 8 | 22,023/s | 0.34 ms | 0.85 ms | |
+| Get | 64 | 52,038/s | 1.10 ms | 3.63 ms | |
 
-Writes top out at about 1,200 per second. A single write takes about 1 ms, which is two fsyncs in a row (the leader's, then a follower's, each about 0.43 ms on this disk) plus the HTTP round trip. More clients don't raise the throughput, they just wait longer, because the leader writes and fsyncs every entry on its own. The obvious next step is group commit, specifically writing all the entries that arrive during one fsync as a single WAL append. The WAL already supports that, since one `Append` can hold many records.
+A single write takes about 1 ms, which is two fsyncs in a row (the leader's, then a follower's, each about 0.43 ms on this disk) plus the HTTP round trip. The leader used to write and fsync every entry on its own, so writes topped out at about 1,200 per second no matter how many clients there were. Now it uses group commit. Specifically, the requests that pile up while the leader is busy with one fsync all go into the next WAL append together, up to 64 at a time. There's no timer, so a client on its own never waits for a batch to fill, and batches just get bigger as the load goes up. That raised write throughput with 32 clients from about 1,200 to 4,300 per second.
+
+Past about 50 clients, write throughput drops again, and that's the next thing to fix. The leader only moves its record of where a follower is up to forward when the follower acknowledges, so every message re-sends everything the follower hasn't acknowledged yet, and every acknowledgment sets off another message. I measured it, and with 8 clients the leader was sending each entry to each follower about 245 times, so the nodes spend most of their CPU encoding and decoding duplicates. It doesn't affect correctness, since followers skip entries they already have. The standard fix is pipelining, specifically moving that record forward as soon as entries are sent, and going back to one message at a time after a follower rejects one.
 
 Reads scale much better, up to about 54,000 per second with 64 clients, since they don't touch the disk. Each read still needs a heartbeat round to a majority (ReadIndex), but reads that arrive together share one round, so the more clients there are, the more reads each round serves.
 

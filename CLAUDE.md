@@ -77,6 +77,11 @@ Create packages only when the phase that needs them begins.
   recently (stickiness) applies only with CheckQuorum: without it, a one-way
   partition can deadlock the cluster (see `inLeaderLease`). Same on/off rule
   as CheckQuorum.
+- Group commit: the server loop takes the client requests waiting behind the
+  one it received, up to `kv.MaxBatch`, and submits them together; their
+  writes become one `Propose`, so one storage write and one fsync. There is
+  no timer: batches form only from requests that queued while the loop was
+  busy, so a lone request is never delayed.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
