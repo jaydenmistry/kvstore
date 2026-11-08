@@ -52,7 +52,7 @@ These are the decisions I'd want to talk through in an interview. Each one has t
 
 **The Raft core is deterministic.** It advances on `Tick()` calls instead of timers, gets its randomness from a seeded source, and sends messages and writes to disk through interfaces. So a test can run a five-node cluster in one goroutine on a simulated network, and any failure can be replayed exactly from its seed.
 
-**Nothing is acknowledged before it's on disk.** The current term, vote, and log entries are fsynced before any reply that depends on them (Figure 2 of the paper). Each WAL append is one CRC32C-checksummed frame, so a batch survives a crash completely or not at all. Recovery only discards a damaged final frame, since that's the only write that can't have been acknowledged.
+**Nothing is acknowledged before it's on disk.** The current term, vote, and log entries are fsynced before any reply that depends on them (Figure 2 of the paper). Each WAL append is one CRC32C-checksummed frame, so a batch survives a crash completely or not at all. Recovery only discards a damaged final frame, since that's the only write that can't have been acknowledged. The one thing that doesn't wait for the disk is a leader sending new entries to followers. It writes its own copy at the same time (§10.2.1 of the thesis), and it only counts that copy toward a majority once the write is durable, since a commit has to rest on a majority of copies that are actually on disk.
 
 **A failed fsync stops the node.** On Linux, a failed fsync can drop the dirty pages and mark them clean, so retrying it can "succeed" without the data being on disk. The node exits with a dedicated status (3) instead, and the systemd unit in `deploy/` is set up so it won't restart automatically.
 
@@ -85,21 +85,25 @@ I measured a three-node cluster with `scripts/bench.sh`, which starts a fresh lo
 
 | Operation | Clients | Throughput | p50 latency | p99 latency |
 |---|---:|---:|---:|---:|
-| Put | 1 | 925/s | 1.03 ms | 2.33 ms |
-| Put | 8 | 2,267/s | 3.49 ms | 7.01 ms |
-| Put | 32 | 8,367/s | 3.43 ms | 8.22 ms |
-| Put | 128 | 22,111/s | 5.23 ms | 11.96 ms |
-| Get | 1 | 5,519/s | 0.17 ms | 0.27 ms |
-| Get | 8 | 23,055/s | 0.33 ms | 0.78 ms |
-| Get | 128 | 60,376/s | 1.90 ms | 5.94 ms |
+| Put | 1 | 1,319/s | 0.72 ms | 1.44 ms |
+| Put | 8 | 4,873/s | 1.53 ms | 5.12 ms |
+| Put | 32 | 16,345/s | 1.76 ms | 5.66 ms |
+| Put | 128 | 29,159/s | 3.66 ms | 10.26 ms |
+| Get | 1 | 5,560/s | 0.17 ms | 0.28 ms |
+| Get | 8 | 22,714/s | 0.34 ms | 0.75 ms |
+| Get | 128 | 53,197/s | 2.15 ms | 6.94 ms |
 
-A single write takes about 1 ms, which is two fsyncs in a row (the leader's, then a follower's, each about 0.43 ms on this disk) plus the HTTP round trip. Getting writes to scale past that took two changes, and the benchmark is what showed me both.
+A single write takes about 0.7 ms. That's the leader's fsync and a follower's (each about 0.43 ms on this disk) running at the same time, plus the HTTP round trip. Getting writes to scale took four changes, and the benchmark, plus some timing of the server loop, is what showed me each one.
 
 The first was group commit. The leader used to write and fsync every entry on its own, so writes topped out at about 1,200 per second no matter how many clients there were. Now the requests that pile up while the leader is busy with one fsync all go into the next WAL append together, up to 64 at a time. There's no timer, so a client on its own never waits for a batch to fill, and batches just get bigger as the load goes up. That got 32 clients to about 4,300 writes per second, but past about 50 clients throughput dropped again.
 
-The second fix was in replication. The leader only moved its record of where a follower was up to (`next`) forward when the follower acknowledged, so every message re-sent everything the follower hadn't acknowledged yet, and every acknowledgment set off another message. I measured it, and with 8 clients the leader was sending each entry to each follower about 245 times, so the nodes spent most of their CPU encoding and decoding duplicates. The fix is pipelining, the way etcd does it. Once a follower's log is known to match, the leader sends each entry as soon as it's written and moves `next` past it right away. After a rejection it goes back to probing, specifically one message at a time until the follower answers, since it no longer knows where the follower's log ends. Now each entry goes to each follower once, and writes reach about 22,000 per second with 128 clients. None of this touches safety, since a follower still checks every message against its own log before accepting it (§5.3), so a wrong guess about `next` only costs a retry.
+The second fix was in replication. The leader only moved its record of where a follower was up to (`next`) forward when the follower acknowledged, so every message re-sent everything the follower hadn't acknowledged yet, and every acknowledgment set off another message. I measured it, and with 8 clients the leader was sending each entry to each follower about 245 times, so the nodes spent most of their CPU encoding and decoding duplicates. The fix is pipelining, the way etcd does it. Once a follower's log is known to match, the leader sends each entry as soon as it's written and moves `next` past it right away. After a rejection it goes back to probing, specifically one message at a time until the follower answers, since it no longer knows where the follower's log ends. Now each entry goes to each follower once, and writes reached about 22,000 per second with 128 clients. None of this touches safety, since a follower still checks every message against its own log before accepting it (§5.3), so a wrong guess about `next` only costs a retry.
 
-Reads are faster still, up to about 60,000 per second with 128 clients, since they don't touch the disk. Each read still needs a heartbeat round to a majority (ReadIndex), but reads that arrive together share one round, so the more clients there are, the more reads each round serves.
+The third change came from timing where the server loop spends its time. With 8 clients, every node was in fsync close to 90% of the time, and each follower was running one message behind the whole time. When it finished writing one AppendEntries request the next one was already waiting, so every write sat through an extra follower fsync, and the follower never got a chance to catch up. Now a node takes all the messages that have queued up at once, and a follower merges AppendEntries requests that continue each other into one write and one reply. A merged request is one the leader could have sent itself, so the usual consistency check still covers it. Only about 2% of requests actually get merged, but that's enough for followers to catch up and stay caught up, and it raised write throughput by 10 to 16%.
+
+The fourth is from the Raft thesis (§10.2.1). The leader used to fsync new entries before sending them, so its write and the followers' happened one after the other. Now a background goroutine writes them while the leader sends them, and the leader only counts its own copy toward a majority once that write is durable. If a majority of followers write an entry first, it can commit before the leader's own write is done. Writes that queue up behind the one in progress share the next fsync. That cut write latency by about a third with one client and about half with 8 or more, and writes now reach about 29,000 per second with 128 clients.
+
+Reads are faster still, about 53,000 to 61,000 per second with 128 clients (it varies a lot from run to run at that load), since they don't touch the disk. Each read still needs a heartbeat round to a majority (ReadIndex), but reads that arrive together share one round, so the more clients there are, the more reads each round serves.
 
 Running the benchmark also turned up a bug in the Go client. Every `Client` shared Go's default HTTP connection pool, which only keeps two idle connections per host, so concurrent clients were opening a new TCP connection for almost every request. Giving each `Client` its own pool raised read throughput with 32 clients from about 29,000 to 45,000 per second.
 

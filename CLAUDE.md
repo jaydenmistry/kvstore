@@ -89,6 +89,18 @@ Create packages only when the phase that needs them begins.
   if it is above `match` and below `next`, and while probing only if it
   answers the latest probe. Safety rests on the follower's consistency
   check, never on `next`.
+- Follower merging: `Raft.Step` takes every message the loop has queued,
+  and merges AppendEntries requests from the same leader and term where
+  each starts at the previous one's last entry (index and term), so a
+  follower that fell behind writes them in one Save. The merged request
+  is one the leader could have sent; the consistency check still applies.
+- Background leader writes (thesis §10.2.1): with an `AsyncStorage`
+  (kvserver wraps DiskStorage in `BackgroundStorage`), a leader starts its
+  write and sends the entries at once, and counts itself in `match` only
+  when `Persisted` reports the write durable, for its current term only.
+  Every Save and SaveSnapshot waits for earlier background writes, so a
+  term change, vote, follower write, or snapshot never overtakes one. A
+  failed background write is fatal, like any other.
 - Writes carry (client ID, seq). The state machine keeps each client's latest
   seq and its result, so a retried write is applied once and returns the
   original result. A client has one request outstanding at a time.
@@ -134,7 +146,10 @@ Create packages only when the phase that needs them begins.
 - Prefer property-style tests over many seeds for crash and partition scenarios.
 - Raft cluster tests (harness in `internal/raft/harness_test.go`) run every node on the
   simulated `transport.Network` from one goroutine and check safety invariants
-  after every `Step` and `Tick`, not just at the end.
+  after every `Step` and `Tick`, not just at the end. Nodes get their due
+  messages in runs of random length, so appends merge. With
+  `withAsyncWrites`, background writes finish and are reported at random
+  times (slowly in some runs), and a crash loses the unfinished ones.
 - KV tests (`internal/kv`) run simulated clients that retry like real ones and
   check the whole history with a linearizability checker, per key.
 - Tests over real sockets (TCP transport, server end to end) cannot avoid real
