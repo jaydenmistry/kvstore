@@ -166,13 +166,20 @@ func (c *cluster) crash(id uint64) {
 func (c *cluster) tick() {
 	c.t.Helper()
 	c.ticks++
-	c.net.Tick(func(m raft.Message) {
-		if p := c.nodes[m.To]; p != nil {
-			if err := p.Step(m); err != nil {
-				c.fatalf("node %d Step: %v", m.To, err)
+	// Each node gets its due messages in runs of random length, as the
+	// server loop takes what has queued, so Raft merges appends.
+	due := make(map[uint64][]raft.Message)
+	c.net.Tick(func(m raft.Message) { due[m.To] = append(due[m.To], m) })
+	for _, id := range c.ids {
+		msgs := due[id]
+		for len(msgs) > 0 && c.nodes[id] != nil {
+			run := msgs[:1+c.rng.IntN(len(msgs))]
+			msgs = msgs[len(run):]
+			if err := c.nodes[id].Step(run...); err != nil {
+				c.fatalf("node %d Step: %v", id, err)
 			}
 		}
-	})
+	}
 	for _, id := range c.ids {
 		if p := c.nodes[id]; p != nil {
 			if err := p.Tick(); err != nil {

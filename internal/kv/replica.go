@@ -208,9 +208,10 @@ func (p *Replica) Tick() error {
 	return p.update()
 }
 
-// Step processes a message from another node.
-func (p *Replica) Step(m raft.Message) error {
-	if err := p.raft.Step(m); err != nil {
+// Step processes messages from other nodes, in order. Passing several
+// together lets Raft merge them (see raft.Raft.Step).
+func (p *Replica) Step(msgs ...raft.Message) error {
+	if err := p.raft.Step(msgs...); err != nil {
 		return err
 	}
 	return p.update()

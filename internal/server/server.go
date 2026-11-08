@@ -215,7 +215,7 @@ func (s *Server) loop(ctx context.Context) error {
 		case <-ticker.C:
 			err = s.replica.Tick()
 		case m := <-s.tr.Recv():
-			err = s.replica.Step(m)
+			err = s.replica.Step(s.received(m)...)
 		case op := <-s.ops:
 			err = op()
 		case sub := <-s.submits:
@@ -247,6 +247,26 @@ func (s *Server) batch(first kv.Submission) []kv.Submission {
 		}
 	}
 	return subs
+}
+
+// maxMessages caps the Raft messages the loop takes at once.
+const maxMessages = 64
+
+// received returns first and the messages already queued behind it, up to
+// maxMessages. Raft merges AppendEntries requests among them that continue
+// one another, so a follower that fell behind while it was writing saves
+// what has queued up in one write. Like batch, it never waits for more.
+func (s *Server) received(first raft.Message) []raft.Message {
+	msgs := []raft.Message{first}
+	for len(msgs) < maxMessages {
+		select {
+		case m := <-s.tr.Recv():
+			msgs = append(msgs, m)
+		default:
+			return msgs
+		}
+	}
+	return msgs
 }
 
 // exec runs f on the loop goroutine and waits for it to finish.
