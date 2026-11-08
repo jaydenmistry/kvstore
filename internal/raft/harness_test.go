@@ -75,6 +75,11 @@ type cluster struct {
 	// checkQuorum and preVote are passed to every node's Config.
 	checkQuorum bool
 	preVote     bool
+	// async, if set, gives every node background writes, which tick
+	// finishes and reports at random times (see asyncStorage): each tick,
+	// with probability 1/async.
+	async  int
+	asyncs map[uint64]*asyncStorage
 }
 
 // clusterOption configures a cluster before its nodes start.
@@ -86,6 +91,55 @@ func withCheckQuorum(on bool) clusterOption {
 
 func withPreVote(on bool) clusterOption {
 	return func(c *cluster) { c.preVote = on }
+}
+
+// withAsyncWrites gives nodes background writes, finished and reported
+// each tick with probability 1/slowness. Zero turns them off.
+func withAsyncWrites(slowness int) clusterOption {
+	return func(c *cluster) { c.async = slowness }
+}
+
+// asyncStorage gives a node background writes (raft.AsyncStorage) that the
+// harness finishes when it chooses. Like raft.BackgroundStorage, a Save or
+// SaveSnapshot first writes everything pending. A crash loses what is
+// still pending, and reports not yet delivered.
+type asyncStorage struct {
+	raft.Storage
+	pending [][]raft.Entry
+	// index and term are the last entry written in the background, and
+	// unreported says Persisted has not been told yet.
+	index, term uint64
+	unreported  bool
+}
+
+func (s *asyncStorage) SaveAsync(entries []raft.Entry) {
+	s.pending = append(s.pending, slices.Clone(entries))
+}
+
+// write writes the first n pending writes.
+func (s *asyncStorage) write(n int) error {
+	for _, ents := range s.pending[:n] {
+		if err := s.Storage.Save(nil, ents); err != nil {
+			return err
+		}
+		s.index, s.term, s.unreported = ents[len(ents)-1].Index, ents[len(ents)-1].Term, true
+	}
+	s.pending = s.pending[n:]
+	return nil
+}
+
+func (s *asyncStorage) Save(hs *raft.HardState, entries []raft.Entry) error {
+	if err := s.write(len(s.pending)); err != nil {
+		return err
+	}
+	return s.Storage.Save(hs, entries)
+}
+
+func (s *asyncStorage) SaveSnapshot(snap raft.Snapshot) error {
+	if err := s.write(len(s.pending)); err != nil {
+		return err
+	}
+	return s.Storage.SaveSnapshot(snap)
 }
 
 func newCluster(t *testing.T, n int, seed uint64, opts ...clusterOption) *cluster {
@@ -111,6 +165,7 @@ func buildCluster(t *testing.T, n int, seed uint64, disk bool, opts []clusterOpt
 		votes:         make(map[uint64]map[uint64]uint64),
 		maxTerm:       make(map[uint64]uint64),
 		committed:     make(map[uint64]raft.Entry),
+		asyncs:        make(map[uint64]*asyncStorage),
 		seenCommit:    make(map[uint64]uint64),
 		applied:       make(map[uint64][]raft.Entry),
 		checkedLeader: make(map[uint64]uint64),
@@ -153,6 +208,12 @@ func (c *cluster) start(id uint64) {
 		}
 		c.storage[id] = s
 	}
+	storage := c.storage[id]
+	if c.async > 0 {
+		// A new one each start: a crash lost the old one's pending writes.
+		c.asyncs[id] = &asyncStorage{Storage: storage}
+		storage = c.asyncs[id]
+	}
 	r, err := raft.New(raft.Config{
 		ID:            id,
 		Peers:         c.ids,
@@ -160,7 +221,7 @@ func (c *cluster) start(id uint64) {
 		HeartbeatTick: heartbeatTick,
 		CheckQuorum:   c.checkQuorum,
 		PreVote:       c.preVote,
-		Storage:       c.storage[id],
+		Storage:       storage,
 		Transport:     c.net.Endpoint(id),
 		Rand:          rand.New(rand.NewPCG(c.rng.Uint64(), id)),
 	})
@@ -216,6 +277,11 @@ func (c *cluster) tick() {
 		}
 	}
 	for _, id := range c.ids {
+		if c.async > 0 && c.nodes[id] != nil {
+			c.finishWrites(id)
+		}
+	}
+	for _, id := range c.ids {
 		if r := c.nodes[id]; r != nil {
 			if err := r.Tick(); err != nil {
 				c.fatalf("node %d Tick: %v", id, err)
@@ -225,6 +291,24 @@ func (c *cluster) tick() {
 	}
 	if c.ticks%10 == 0 {
 		c.checkLogMatching()
+	}
+}
+
+// finishWrites finishes some of a node's background writes, and maybe
+// reports the last one finished, each at random. Writes can finish long
+// before they are reported, or wait for many ticks.
+func (c *cluster) finishWrites(id uint64) {
+	c.t.Helper()
+	s := c.asyncs[id]
+	if len(s.pending) > 0 && c.rng.IntN(c.async) == 0 {
+		if err := s.write(1 + c.rng.IntN(len(s.pending))); err != nil {
+			c.fatalf("node %d background write: %v", id, err)
+		}
+	}
+	if s.unreported && c.rng.IntN(c.async) == 0 {
+		s.unreported = false
+		c.nodes[id].Persisted(s.index, s.term)
+		c.check(id)
 	}
 }
 

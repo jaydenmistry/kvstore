@@ -56,6 +56,23 @@ type Storage interface {
 	SaveSnapshot(snap Snapshot) error
 }
 
+// AsyncStorage is a Storage that can also save entries in the background.
+// A leader whose Storage implements it writes its new entries to its own
+// disk while it sends them to followers, instead of before (thesis
+// §10.2.1), and counts itself toward a majority only once they are durable.
+//
+// Whoever drives the Raft node must report each finished write with
+// Raft.Persisted; until then the leader does not count itself.
+type AsyncStorage interface {
+	Storage
+	// SaveAsync starts saving entries as Save would, and returns without
+	// waiting. Writes take effect in the order they were started, each one
+	// atomically, and Save and SaveSnapshot first wait for every write
+	// started before them: Raft relies on that before it sends anything
+	// that claims its state is durable.
+	SaveAsync(entries []Entry)
+}
+
 // logSuffix is a log whose entries up to and including (index, term) have
 // been replaced by a snapshot. With no snapshot, index and term are 0: the
 // empty position before the first entry, whose term 0 makes the consistency

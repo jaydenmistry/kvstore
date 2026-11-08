@@ -13,9 +13,11 @@
 //
 // Raft persists state through Storage and sends messages through Transport
 // synchronously from inside those calls, always persisting before it sends
-// anything that depends on the persisted state. Raft never reads a clock and
-// draws all randomness from Config.Rand, so tests can run it
-// deterministically.
+// anything that depends on the persisted state. The one exception is a
+// leader whose Storage is an AsyncStorage: it sends new entries while its own
+// write of them is under way, and the caller reports the write's end with
+// Persisted. Raft never reads a clock and draws all randomness from
+// Config.Rand, so tests can run it deterministically.
 package raft
 
 import (
@@ -102,6 +104,7 @@ type Raft struct {
 	id        uint64
 	peers     []uint64 // sorted, includes id
 	storage   Storage
+	async     AsyncStorage // storage, if it can write in the background
 	transport Transport
 	rng       *rand.Rand
 
@@ -224,6 +227,7 @@ func New(cfg Config) (*Raft, error) {
 		checkQuorum:   cfg.CheckQuorum,
 		preVote:       cfg.PreVote,
 	}
+	r.async, _ = cfg.Storage.(AsyncStorage)
 	if snap.Index > 0 {
 		r.pendingSnap = &snap
 	}
@@ -281,6 +285,24 @@ func (r *Raft) Propose(data ...[]byte) (index, term uint64, err error) {
 	}
 	r.broadcastEntries()
 	return ents[0].Index, r.term, nil
+}
+
+// Persisted reports that a write started with AsyncStorage.SaveAsync has
+// finished: the log through index, whose entry there has term, is durable.
+// Reports may be combined, as long as the latest is reported.
+//
+// Only a leader's report about its current term counts: a leader writes in
+// the background only entries of its own term, and when it was elected
+// everything before them was already durable (campaigning saved the new
+// term, which waited for earlier writes). A report from an earlier term
+// is stale, and the entry it names may since have been replaced by one
+// not yet written.
+func (r *Raft) Persisted(index, term uint64) {
+	if r.err != nil || r.state != Leader || term != r.term || index <= r.match[r.id] || index > r.lastIndex() {
+		return
+	}
+	r.match[r.id] = index
+	r.maybeCommit()
 }
 
 // TakeCommitted returns the entries committed since the previous call, in
@@ -956,7 +978,20 @@ func (r *Raft) advanceReads() {
 
 // appendAsLeader adds ents, which follow the last entry, to the leader's
 // own log in one storage write. The caller sends them out.
+//
+// With AsyncStorage the write only starts here, and the caller sends the
+// entries while it runs (thesis §10.2.1). That is safe because a message
+// carrying entries claims nothing about the leader's disk. What must wait
+// is the leader counting itself toward a majority, which Persisted does
+// once the write is durable: commitment rests on durable copies. A
+// majority of followers can commit the entries before the leader's own
+// write ends.
 func (r *Raft) appendAsLeader(ents []Entry) bool {
+	if r.async != nil {
+		r.async.SaveAsync(ents)
+		r.log.splice(ents)
+		return true
+	}
 	if !r.saveEntries(ents) {
 		return false
 	}
@@ -1095,6 +1130,8 @@ func (r *Raft) becomeLeader() {
 		r.next[p] = r.lastIndex() + 1
 		r.probing[p] = p != r.id
 	}
+	// Everything in the log is durable: campaigning saved the new term,
+	// and a save waits for background writes started before it.
 	r.match[r.id] = r.lastIndex()
 	r.acked = make(map[uint64]uint64, len(r.peers))
 	// A full window to hear from a majority, counting only this term.

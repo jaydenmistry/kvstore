@@ -188,7 +188,7 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 	var proposed, committed, installed, merges int
 	for seed := range uint64(seeds) {
 		var c *cluster
-		opts := []clusterOption{withCheckQuorum(seed/4%2 == 1), withPreVote(seed/8%2 == 1)}
+		opts := []clusterOption{withCheckQuorum(seed/4%2 == 1), withPreVote(seed/8%2 == 1), withAsyncWrites([]int{0, 2, 0, 10}[seed/16%4])}
 		if seed%2 == 0 {
 			c = newCluster(t, 5, seed, opts...)
 		} else {
@@ -267,7 +267,7 @@ func TestDiskClusterSurvivesFullPowerLoss(t *testing.T) {
 	// Every node loses power at once, repeatedly. Committed entries must
 	// survive because each was fsynced on a majority before it committed.
 	for seed := range uint64(30) {
-		c := newDiskCluster(t, 3, seed)
+		c := newDiskCluster(t, 3, seed, withAsyncWrites([]int{0, 2, 10}[seed/2%3]))
 		if seed%2 == 1 {
 			c.compactEvery = 5
 		}
