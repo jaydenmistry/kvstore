@@ -83,6 +83,9 @@ type Server struct {
 	cfg     Config
 	log     *slog.Logger
 	storage *raft.DiskStorage
+	// writer writes the leader's new entries to storage in the background,
+	// so it sends them to followers without waiting for its own fsync.
+	writer  *raft.BackgroundStorage
 	tr      *transport.TCP
 	replica *kv.Replica
 	http    *http.Server
@@ -134,6 +137,7 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		raftAddrs[id] = p.Raft
 	}
 	tr := transport.NewTCP(cfg.ID, raftLn, raftAddrs, log)
+	writer := raft.NewBackgroundStorage(storage)
 	r, err := raft.New(raft.Config{
 		ID:            cfg.ID,
 		Peers:         ids,
@@ -144,7 +148,7 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		// that loses touch with the leader deposes it when it reconnects.
 		CheckQuorum: !cfg.DisableCheckQuorum,
 		PreVote:     !cfg.DisablePreVote,
-		Storage:     storage,
+		Storage:     writer,
 		Transport:   tr,
 	})
 	if err != nil {
@@ -157,6 +161,7 @@ func New(cfg Config, raftLn, apiLn net.Listener) (*Server, error) {
 		cfg:     cfg,
 		log:     log,
 		storage: storage,
+		writer:  writer,
 		tr:      tr,
 		replica: kv.NewReplica(r, kv.Config{
 			RequestTimeout: timeoutTicks,
@@ -196,6 +201,13 @@ func (s *Server) Run(ctx context.Context) error {
 		err = fmt.Errorf("server: HTTP: %w", e)
 	}
 	s.tr.Close()
+	// A background write still running must finish before the WAL closes.
+	// If one failed, even after the loop stopped, the exit is fatal like
+	// any other failed write: the page cache may hold what never reached
+	// the disk.
+	if e := s.writer.Wait(); e != nil && err == nil {
+		err = fmt.Errorf("%w: background write: %w", ErrFatal, e)
+	}
 	if e := s.storage.Close(); e != nil && err == nil {
 		err = fmt.Errorf("%w: closing storage: %w", ErrFatal, e)
 	}
@@ -220,6 +232,13 @@ func (s *Server) loop(ctx context.Context) error {
 			err = op()
 		case sub := <-s.submits:
 			err = s.replica.SubmitBatch(s.batch(sub))
+		case <-s.writer.Written():
+			index, term, werr := s.writer.LastWritten()
+			if werr != nil {
+				err = fmt.Errorf("background write: %w", werr)
+			} else {
+				err = s.replica.Persisted(index, term)
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrFatal, err)

@@ -217,6 +217,13 @@ func (p *Replica) Step(msgs ...raft.Message) error {
 	return p.update()
 }
 
+// Persisted reports that a background write finished, for a Replica whose
+// Raft storage is a raft.AsyncStorage (see raft.Raft.Persisted).
+func (p *Replica) Persisted(index, term uint64) error {
+	p.raft.Persisted(index, term)
+	return p.update()
+}
+
 func (p *Replica) notLeader() Result {
 	return Result{Err: ErrNotLeader, Leader: p.raft.Status().Lead}
 }
