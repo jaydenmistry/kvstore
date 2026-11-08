@@ -427,17 +427,78 @@ func (r *Raft) Tick() error {
 	return r.err
 }
 
-// Step processes one message from another node. Messages not addressed to
-// this node, or from a node outside the cluster, are ignored.
+// Step processes messages from other nodes, in order. Messages not
+// addressed to this node, or from a node outside the cluster, are ignored.
+//
+// A caller that has several messages waiting should pass them together:
+// AppendEntries requests that continue one another are then merged, so a
+// follower saves their entries in one storage write (see mergeAppend).
 //
 // If Step returns an error, Storage failed and the node has stopped. The
 // caller should treat this as fatal.
-func (r *Raft) Step(m Message) error {
-	if r.err != nil {
-		return r.err
+func (r *Raft) Step(msgs ...Message) error {
+	for i := 0; i < len(msgs) && r.err == nil; i++ {
+		m := msgs[i]
+		for i+1 < len(msgs) && r.mergeAppend(&m, msgs[i+1]) {
+			i++
+		}
+		r.step(m)
 	}
+	return r.err
+}
+
+// mergeAppend merges next into m if both are AppendEntries requests from
+// the same leader and term, and next carries the entries that follow m's
+// last one (next's PrevLogIndex and PrevLogTerm are m's last entry). The
+// merged request holds m's entries then next's, with the later commit index
+// and heartbeat round.
+//
+// It is a request the leader could have sent itself: a leader never
+// removes entries from its own log, so m's entries and next's are one
+// contiguous run of it, and both commit indexes were committed when sent.
+// The follower's consistency check (§5.3) applies to it as to any other.
+// Handling it leaves the log as handling m and then next would, with one
+// storage write and one response for both. If the check fails, the leader
+// receives one rejection instead of two, as if next's had been lost. The
+// commit index can end up higher than handling them in turn would leave
+// it, if m was the later one sent: it is still a committed index, and no
+// higher than the last entry known to match the leader's log.
+//
+// The merged entries stay within MaxBytesPerMessage, which bounds the
+// follower's write as it does for a single request.
+func (r *Raft) mergeAppend(m *Message, next Message) bool {
+	if m.Type != MsgApp || next.Type != MsgApp || m.From != next.From || m.Term != next.Term || m.To != next.To {
+		return false
+	}
+	lastIndex, lastTerm := m.PrevLogIndex, m.PrevLogTerm
+	if n := len(m.Entries); n > 0 {
+		lastIndex, lastTerm = m.Entries[n-1].Index, m.Entries[n-1].Term
+	}
+	if next.PrevLogIndex != lastIndex || next.PrevLogTerm != lastTerm {
+		return false
+	}
+	if dataSize(m.Entries)+dataSize(next.Entries) > r.maxMsgBytes {
+		return false
+	}
+	// A new slice: the caller's messages are left as they were.
+	m.Entries = slices.Concat(m.Entries, next.Entries)
+	m.LeaderCommit = max(m.LeaderCommit, next.LeaderCommit)
+	m.Round = max(m.Round, next.Round)
+	return true
+}
+
+func dataSize(ents []Entry) int {
+	n := 0
+	for _, e := range ents {
+		n += len(e.Data)
+	}
+	return n
+}
+
+// step processes one message.
+func (r *Raft) step(m Message) {
 	if m.To != r.id || m.From == r.id || !slices.Contains(r.peers, m.From) {
-		return nil
+		return
 	}
 
 	// A pre-vote request, and a grant, carry a term the sender has not
@@ -448,11 +509,11 @@ func (r *Raft) Step(m Message) error {
 	// behind learns the current term.
 	if m.Type == MsgPreVote {
 		r.handlePreVote(m)
-		return r.err
+		return
 	}
 	if m.Type == MsgPreVoteResp && m.VoteGranted {
 		r.handlePreVoteResp(m)
-		return r.err
+		return
 	}
 
 	switch {
@@ -466,7 +527,7 @@ func (r *Raft) Step(m Message) error {
 			lead = m.From
 		}
 		if !r.becomeFollower(m.Term, lead) {
-			return r.err
+			return
 		}
 	case m.Term < r.term:
 		// The sender is behind. Answer requests with our term so a deposed
@@ -479,7 +540,7 @@ func (r *Raft) Step(m Message) error {
 		case MsgApp, MsgSnap:
 			r.send(Message{Type: MsgAppResp, To: m.From})
 		}
-		return nil
+		return
 	}
 
 	// From here on, m.Term == r.term.
@@ -497,7 +558,6 @@ func (r *Raft) Step(m Message) error {
 	case MsgPreVoteResp:
 		r.handlePreVoteResp(m)
 	}
-	return r.err
 }
 
 // preCampaign asks every peer whether it would vote for us in the next term

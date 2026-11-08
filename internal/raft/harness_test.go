@@ -69,6 +69,9 @@ type cluster struct {
 	// installed counts snapshots restored by running nodes, which come
 	// from InstallSnapshot (not from a restart).
 	installed int
+	// merges counts AppendEntries requests that Step merged into the one
+	// before them.
+	merges int
 	// checkQuorum and preVote are passed to every node's Config.
 	checkQuorum bool
 	preVote     bool
@@ -195,16 +198,23 @@ func (c *cluster) restart(id uint64) {
 func (c *cluster) tick() {
 	c.t.Helper()
 	c.ticks++
-	c.net.Tick(func(m raft.Message) {
-		r := c.nodes[m.To]
-		if r == nil {
-			return
+	// Each node gets its due messages in runs of random length, as a busy
+	// node would find several queued, so Step merges appends that continue
+	// one another.
+	due := make(map[uint64][]raft.Message)
+	c.net.Tick(func(m raft.Message) { due[m.To] = append(due[m.To], m) })
+	for _, id := range c.ids {
+		msgs := due[id]
+		for len(msgs) > 0 && c.nodes[id] != nil {
+			run := msgs[:1+c.rng.IntN(len(msgs))]
+			msgs = msgs[len(run):]
+			c.merges += countMergeable(run)
+			if err := c.nodes[id].Step(run...); err != nil {
+				c.fatalf("node %d Step(%+v): %v", id, run, err)
+			}
+			c.check(id)
 		}
-		if err := r.Step(m); err != nil {
-			c.fatalf("node %d Step(%+v): %v", m.To, m, err)
-		}
-		c.check(m.To)
-	})
+	}
 	for _, id := range c.ids {
 		if r := c.nodes[id]; r != nil {
 			if err := r.Tick(); err != nil {
@@ -216,6 +226,25 @@ func (c *cluster) tick() {
 	if c.ticks%10 == 0 {
 		c.checkLogMatching()
 	}
+}
+
+// countMergeable counts the messages in msgs that continue the
+// AppendEntries request just before them, which Step merges (unless the
+// byte limit stops it).
+func countMergeable(msgs []raft.Message) int {
+	n := 0
+	for i := 1; i < len(msgs); i++ {
+		a, b := msgs[i-1], msgs[i]
+		last, lastTerm := a.PrevLogIndex, a.PrevLogTerm
+		if k := len(a.Entries); k > 0 {
+			last, lastTerm = a.Entries[k-1].Index, a.Entries[k-1].Term
+		}
+		if a.Type == raft.MsgApp && b.Type == raft.MsgApp && a.From == b.From && a.Term == b.Term &&
+			b.PrevLogIndex == last && b.PrevLogTerm == lastTerm {
+			n++
+		}
+	}
+	return n
 }
 
 func (c *cluster) run(ticks int) {

@@ -185,7 +185,7 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 	// repaired, every node must converge on the same applied log, which
 	// must contain every entry that ever committed.
 	const seeds = 200
-	var proposed, committed, installed int
+	var proposed, committed, installed, merges int
 	for seed := range uint64(seeds) {
 		var c *cluster
 		opts := []clusterOption{withCheckQuorum(seed/4%2 == 1), withPreVote(seed/8%2 == 1)}
@@ -255,8 +255,9 @@ func TestCommittedEntriesSurviveChaos(t *testing.T) {
 		}
 		committed += len(c.committed)
 		installed += c.installed
+		merges += c.merges
 	}
-	t.Logf("%d proposals accepted by a leader, %d entries committed, %d snapshots installed, across %d runs", proposed, committed, installed, seeds)
+	t.Logf("%d proposals accepted by a leader, %d entries committed, %d snapshots installed, %d appends merged, across %d runs", proposed, committed, installed, merges, seeds)
 	if committed < seeds*50 {
 		t.Fatalf("only %d entries committed across %d runs; chaos too severe to test much", committed, seeds)
 	}

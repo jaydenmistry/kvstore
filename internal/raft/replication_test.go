@@ -137,6 +137,118 @@ func TestFollowerCommitLimitedToVerifiedEntries(t *testing.T) {
 	}
 }
 
+func TestFollowerMergesAppendsThatContinueEachOther(t *testing.T) {
+	// Three requests from the leader, queued while the follower was busy,
+	// each starting where the previous one ends: one write, one reply.
+	r, st := newNode(t, 2, 1, 2, 3)
+	first := app(1, 2, 1, 0, 0, 0, ents(1, 1, 2, 1))
+	first.Round = 1
+	second := app(1, 2, 1, 2, 1, 1, ents(3, 1))
+	second.Round = 2
+	heartbeat := app(1, 2, 1, 3, 1, 3, nil)
+	heartbeat.Round = 3
+	if err := r.Step(first, second, heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"save term 1 vote 0", "save entries 1-3", "send MsgAppResp to 1 term 1"}
+	if fmt.Sprint(st.ev.log) != fmt.Sprint(want) {
+		t.Fatalf("events:\n got %q\nwant %q", st.ev.log, want)
+	}
+	if m := onlyMessage(t, st); !m.Success || m.MatchIndex != 3 || m.Round != 3 {
+		t.Fatalf("reply %+v, want success with MatchIndex 3 and Round 3", m)
+	}
+	if r.commit != 3 {
+		t.Fatalf("commit %d, want 3", r.commit)
+	}
+	checkLoad(t, st.MemoryStorage, HardState{Term: 1}, ents(1, 1, 2, 1, 3, 1))
+}
+
+func TestFollowerMergesOnlyMatchingAppends(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		second Message
+		check  func(t *testing.T, r *Raft, replies []Message)
+	}{{
+		// The second request needs entries the first does not carry.
+		name:   "gap",
+		second: app(1, 2, 1, 4, 1, 0, ents(5, 1)),
+		check: func(t *testing.T, r *Raft, replies []Message) {
+			if replies[1].Success || replies[1].RejectIndex != 4 {
+				t.Fatalf("second reply %+v, want rejection at 4", replies[1])
+			}
+		},
+	}, {
+		// The second request follows index 2 with a different term, so the
+		// follower's entry 2 conflicts with the leader's (§5.3). Merging
+		// would append entry 3 after an entry it does not follow.
+		name:   "term at previous index differs",
+		second: app(1, 2, 2, 2, 2, 0, ents(3, 2)),
+		check: func(t *testing.T, r *Raft, replies []Message) {
+			if replies[1].Success {
+				t.Fatalf("second reply %+v, want a rejection", replies[1])
+			}
+			checkLog(t, r, ents(1, 1, 2, 1))
+		},
+	}, {
+		// The same leader, reelected: the follower must adopt the new
+		// term, which a request merged into the old term's would hide.
+		name:   "newer term",
+		second: app(1, 2, 2, 2, 1, 0, ents(3, 2)),
+		check: func(t *testing.T, r *Raft, replies []Message) {
+			if r.term != 2 {
+				t.Fatalf("term %d, want 2", r.term)
+			}
+			if !replies[1].Success || replies[1].Term != 2 || replies[1].MatchIndex != 3 {
+				t.Fatalf("second reply %+v, want success in term 2 with MatchIndex 3", replies[1])
+			}
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, st := newNode(t, 2, 1, 2, 3)
+			if err := r.Step(app(1, 2, 1, 0, 0, 0, ents(1, 1, 2, 1)), tc.second); err != nil {
+				t.Fatal(err)
+			}
+			replies := takeSent(st)
+			if len(replies) != 2 || !replies[0].Success || replies[0].MatchIndex != 2 {
+				t.Fatalf("replies %+v, want two, the first a success with MatchIndex 2", replies)
+			}
+			tc.check(t, r, replies)
+		})
+	}
+}
+
+func TestFollowerMergeStaysWithinByteLimit(t *testing.T) {
+	r, st := newNode(t, 2, 1, 2, 3)
+	r.maxMsgBytes = len("1@1") + len("2@1") // two of these entries, not three
+	if err := r.Step(
+		app(1, 2, 1, 0, 0, 0, ents(1, 1)),
+		app(1, 2, 1, 1, 1, 0, ents(2, 1)),
+		app(1, 2, 1, 2, 1, 0, ents(3, 1)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"save term 1 vote 0", "save entries 1-2", "send MsgAppResp to 1 term 1", "save entries 3-3", "send MsgAppResp to 1 term 1"}
+	if fmt.Sprint(st.ev.log) != fmt.Sprint(want) {
+		t.Fatalf("events:\n got %q\nwant %q", st.ev.log, want)
+	}
+}
+
+func TestFollowerMergeLeavesMessagesUnchanged(t *testing.T) {
+	// The first request's entries have spare capacity. Merging must not
+	// write the second request's entries into it: the caller, or another
+	// message sharing the array, still owns it.
+	r, _ := newNode(t, 2, 1, 2, 3)
+	backing := make([]Entry, 2, 4)
+	copy(backing, ents(1, 1, 2, 1))
+	if err := r.Step(app(1, 2, 1, 0, 0, 0, backing), app(1, 2, 1, 2, 1, 0, ents(3, 1, 4, 1))); err != nil {
+		t.Fatal(err)
+	}
+	if spare := backing[:4][2:]; spare[0].Index != 0 || spare[1].Index != 0 {
+		t.Fatalf("merging wrote %+v into the first request's array", spare)
+	}
+	checkLog(t, r, ents(1, 1, 2, 1, 3, 1, 4, 1))
+}
+
 func TestNewLeaderPersistsNoopBeforeSending(t *testing.T) {
 	r, st := newNode(t, 1, 1, 2, 3)
 	makeLeader(t, r)
